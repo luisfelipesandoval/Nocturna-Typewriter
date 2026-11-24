@@ -2,7 +2,7 @@
 
 @layer base {
   :root {
-    --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --font-mono: 'Courier Prime', 'Courier New', Courier, ui-monospace, monospace;
     --font-display: 'Fraunces', Georgia, serif;
     --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
   }

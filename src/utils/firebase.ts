@@ -3,6 +3,8 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signOut as firebaseSignOut,
   onAuthStateChanged,
   User,
@@ -21,13 +23,31 @@ import {
   query,
   where,
 } from 'firebase/firestore';
-import firebaseConfig from '../../firebase-applet-config.json';
+import firebaseConfigJson from '../../firebase-applet-config.json';
 import { Notebook, PageItem } from './pagination';
 
-const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const env = import.meta.env || {};
+export const activeFirebaseConfig = {
+  apiKey: env.VITE_FIREBASE_API_KEY || firebaseConfigJson.apiKey,
+  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || firebaseConfigJson.authDomain,
+  projectId: env.VITE_FIREBASE_PROJECT_ID || firebaseConfigJson.projectId,
+  storageBucket:
+    env.VITE_FIREBASE_STORAGE_BUCKET || firebaseConfigJson.storageBucket,
+  messagingSenderId:
+    env.VITE_FIREBASE_MESSAGING_SENDER_ID ||
+    firebaseConfigJson.messagingSenderId,
+  appId: env.VITE_FIREBASE_APP_ID || firebaseConfigJson.appId,
+  firestoreDatabaseId:
+    env.VITE_FIREBASE_DATABASE_ID || firebaseConfigJson.firestoreDatabaseId,
+};
+
+const app = initializeApp(activeFirebaseConfig);
+export const db = getFirestore(app, activeFirebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({
+  prompt: 'select_account',
+});
 
 export enum OperationType {
   CREATE = 'create',
@@ -95,7 +115,6 @@ async function testConnection() {
 }
 testConnection();
 
-// Blueprint validation constants matching firebase-blueprint.json & firestore.rules
 const ID_REGEX = /^[a-zA-Z0-9_\-]+$/;
 const MAX_ID_LEN = 128;
 const MAX_TITLE_LEN = 200;
@@ -111,16 +130,105 @@ export function sanitizeId(id: string, fallbackPrefix: string = 'doc'): string {
 
 export function sanitizeTitle(title: string): string {
   const trimmed = (title || '').trim().slice(0, MAX_TITLE_LEN);
-  return trimmed.length >= 1 ? trimmed : 'Cuaderno sin título';
+  return trimmed.length >= 1 ? trimmed : 'Sin título';
 }
 
 export function sanitizeContent(content: string): string {
   return (content || '').slice(0, MAX_CONTENT_LEN);
 }
 
-export async function signInWithGoogle(): Promise<User> {
+export interface ParsedAuthError {
+  code: string;
+  title: string;
+  message: string;
+  isUnauthorizedDomain: boolean;
+  isPopupBlocked: boolean;
+  currentHostname: string;
+  projectId: string;
+}
+
+export function parseFirebaseAuthError(err: unknown): ParsedAuthError {
+  const code =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as { code: unknown }).code)
+      : 'auth/unknown';
+  const rawMessage =
+    err instanceof Error ? err.message : String(err || 'Error desconocido');
+  const currentHostname =
+    typeof window !== 'undefined' ? window.location.hostname : 'tu-dominio.vercel.app';
+
+  if (code === 'auth/unauthorized-domain' || rawMessage.includes('unauthorized-domain')) {
+    return {
+      code: 'auth/unauthorized-domain',
+      title: 'Dominio no autorizado en Firebase (Vercel)',
+      message: `Para que el inicio de sesión con Google funcione en "${currentHostname}", debes agregar este dominio en la lista de Dominios Autorizados de Firebase Console.`,
+      isUnauthorizedDomain: true,
+      isPopupBlocked: false,
+      currentHostname,
+      projectId: activeFirebaseConfig.projectId,
+    };
+  }
+
+  if (
+    code === 'auth/popup-blocked' ||
+    code === 'auth/operation-not-supported-in-this-environment'
+  ) {
+    return {
+      code,
+      title: 'Ventana emergente bloqueada en el navegador',
+      message:
+        'Tu navegador móvil bloqueó la ventana emergente. Usa el botón "Ingresar por Redirección (Celular)" de abajo para iniciar sesión sin ventana emergente.',
+      isUnauthorizedDomain: false,
+      isPopupBlocked: true,
+      currentHostname,
+      projectId: activeFirebaseConfig.projectId,
+    };
+  }
+
+  if (
+    code === 'auth/popup-closed-by-user' ||
+    code === 'auth/cancelled-popup-request'
+  ) {
+    return {
+      code,
+      title: 'Ventana cerrada antes de terminar',
+      message:
+        'Se cerró la ventana de Google antes de completar el acceso. Si estás en celular o en Vercel y se cerró sola, verifica que el dominio esté autorizado o usa el modo de redirección.',
+      isUnauthorizedDomain: false,
+      isPopupBlocked: false,
+      currentHostname,
+      projectId: activeFirebaseConfig.projectId,
+    };
+  }
+
+  return {
+    code,
+    title: 'No se pudo iniciar sesión con Google',
+    message: rawMessage,
+    isUnauthorizedDomain: false,
+    isPopupBlocked: false,
+    currentHostname,
+    projectId: activeFirebaseConfig.projectId,
+  };
+}
+
+export async function signInWithGooglePopup(): Promise<User> {
+  // MUST be called synchronously from user click handler without prior awaits
   const result = await signInWithPopup(auth, googleProvider);
   return result.user;
+}
+
+export async function signInWithGoogleRedirect(): Promise<void> {
+  await signInWithRedirect(auth, googleProvider);
+}
+
+export async function checkGoogleRedirectResult(): Promise<User | null> {
+  try {
+    const result = await getRedirectResult(auth);
+    return result?.user || null;
+  } catch (err) {
+    throw err;
+  }
 }
 
 export async function signOutUser(): Promise<void> {
@@ -175,9 +283,7 @@ export async function loadUserNotebooksFromCloud(
         loaded.push({
           id: nbId,
           title:
-            typeof nbData.title === 'string'
-              ? nbData.title
-              : 'Cuaderno sin título',
+            typeof nbData.title === 'string' ? nbData.title : 'Sin título',
           createdAt: nbData.createdAt?.toMillis?.() || Date.now(),
           updatedAt: nbData.updatedAt?.toMillis?.() || Date.now(),
           pages:
@@ -214,6 +320,14 @@ export async function saveNotebookToCloud(
   userId: string,
   notebook: Notebook
 ): Promise<void> {
+  // Do not save an empty untouched temporary draft to cloud until user writes or creates a page
+  const hasAnyContent = notebook.pages.some(
+    (p) => p.content.trim().length > 0
+  );
+  if (notebook.id.startsWith('draft-') && !hasAnyContent) {
+    return;
+  }
+
   const safeUid = sanitizeId(userId, 'u');
   const safeNbId = sanitizeId(notebook.id, 'nb');
   const nbDocPath = `users/${safeUid}/notebooks/${safeNbId}`;
@@ -240,7 +354,6 @@ export async function saveNotebookToCloud(
     handleFirestoreError(error, OperationType.WRITE, nbDocPath);
   }
 
-  // Sync each page in the subcollection
   for (let idx = 0; idx < notebook.pages.length; idx++) {
     const page = notebook.pages[idx];
     const safePageId = sanitizeId(page.id, `pg-${idx}`);
