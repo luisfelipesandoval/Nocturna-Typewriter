@@ -87,6 +87,22 @@ export function saveNotebooks(notebooks: Notebook[]): void {
   } catch {}
 }
 
+export function clearLocalNotebooks(): Notebook {
+  const blank = createBlankDraftNotebook();
+  if (typeof window !== 'undefined') {
+    try {
+      for (const key of OLD_KEYS) {
+        window.localStorage.removeItem(key);
+      }
+      window.localStorage.setItem(
+        STORAGE_KEY_NOTEBOOKS,
+        JSON.stringify([blank])
+      );
+    } catch {}
+  }
+  return blank;
+}
+
 export function loadPreferences(defaultNotebookId: string): UserPreferences {
   const fallback: UserPreferences = {
     activeNotebookId: defaultNotebookId,

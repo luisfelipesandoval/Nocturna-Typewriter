@@ -51,6 +51,7 @@ import {
   soundEngine,
 } from './utils/soundEngine';
 import {
+  clearLocalNotebooks,
   createBlankDraftNotebook,
   DEFAULT_AMBIENT_TRACKS,
   loadNotebooks,
@@ -257,8 +258,19 @@ export default function App() {
           setCloudSyncState('error');
         }
       } else if (!user) {
+        // If transitioning from a logged-in user to signed-out, clear all account pages from screen & local storage
+        const wasSignedIn = initialCloudLoadDoneRef.current !== null;
         initialCloudLoadDoneRef.current = null;
         setCloudSyncState('idle');
+        if (wasSignedIn) {
+          const blankDraft = clearLocalNotebooks();
+          setNotebooks([blankDraft]);
+          setPrefs((prev) => ({
+            ...prev,
+            activeNotebookId: blankDraft.id,
+            activePageIndex: 0,
+          }));
+        }
       }
     });
 
@@ -394,6 +406,33 @@ export default function App() {
 
   const handleSignOut = async () => {
     try {
+      // cancel any pending debounced save timer and flush current written work to cloud before signing out
+      if (cloudSaveTimerRef.current) {
+        window.clearTimeout(cloudSaveTimerRef.current);
+        cloudSaveTimerRef.current = null;
+      }
+      if (currentUser && activeNotebook) {
+        const hasContent = activeNotebook.pages.some(
+          (p) => p.content.trim().length > 0
+        );
+        if (!activeNotebook.id.startsWith('draft-') || hasContent) {
+          try {
+            await saveNotebookToCloud(currentUser.uid, activeNotebook);
+          } catch {}
+        }
+      }
+
+      // Wipe all account writings and pages from local memory & screen so everything returns to zero
+      const blankDraft = clearLocalNotebooks();
+      setNotebooks([blankDraft]);
+      setPrefs((prev) => ({
+        ...prev,
+        activeNotebookId: blankDraft.id,
+        activePageIndex: 0,
+      }));
+      initialCloudLoadDoneRef.current = null;
+      setCloudSyncState('idle');
+
       await signOutUser();
       setActivePopover(null);
       setAuthBanner('Sesión cerrada');
