@@ -15,6 +15,8 @@ import {
   getDoc,
   getDocFromServer,
   getDocs,
+  getDocsFromServer,
+  onSnapshot,
   setDoc,
   updateDoc,
   deleteDoc,
@@ -249,7 +251,7 @@ export function ensurePermanentNotebookId(id: string): string {
 }
 
 /**
- * Loads all notebooks and their subcollection pages for the authenticated user.
+ * Loads all notebooks and their subcollection pages for the authenticated user directly from Firestore server.
  */
 export async function loadUserNotebooksFromCloud(
   userId: string
@@ -261,7 +263,12 @@ export async function loadUserNotebooksFromCloud(
       collection(db, notebooksPath),
       where('ownerId', '==', safeUid)
     );
-    const nbSnap = await getDocs(nbQuery);
+    let nbSnap;
+    try {
+      nbSnap = await getDocsFromServer(nbQuery);
+    } catch {
+      nbSnap = await getDocs(nbQuery);
+    }
     const loaded: Notebook[] = [];
 
     for (const nbDoc of nbSnap.docs) {
@@ -274,7 +281,12 @@ export async function loadUserNotebooksFromCloud(
           collection(db, pagesPath),
           where('ownerId', '==', safeUid)
         );
-        const pgSnap = await getDocs(pgQuery);
+        let pgSnap;
+        try {
+          pgSnap = await getDocsFromServer(pgQuery);
+        } catch {
+          pgSnap = await getDocs(pgQuery);
+        }
         const rawPages: Array<PageItem & { pageNumber: number }> = [];
 
         pgSnap.forEach((pgDoc) => {
@@ -324,6 +336,37 @@ export async function loadUserNotebooksFromCloud(
   } catch (error) {
     handleFirestoreError(error, OperationType.LIST, notebooksPath);
   }
+}
+
+/**
+ * Subscribes in real time to changes in the user's cloud notebooks across devices (e.g., PC <-> Tablet).
+ */
+export function subscribeToUserNotebooks(
+  userId: string,
+  onUpdate: (cloudNotebooks: Notebook[]) => void,
+  onError?: (err: unknown) => void
+): () => void {
+  const safeUid = sanitizeId(userId, 'u');
+  const notebooksPath = `users/${safeUid}/notebooks`;
+  const nbQuery = query(
+    collection(db, notebooksPath),
+    where('ownerId', '==', safeUid)
+  );
+
+  return onSnapshot(
+    nbQuery,
+    async () => {
+      try {
+        const latest = await loadUserNotebooksFromCloud(userId);
+        onUpdate(latest);
+      } catch (err) {
+        onError?.(err);
+      }
+    },
+    (err) => {
+      onError?.(err);
+    }
+  );
 }
 
 /**

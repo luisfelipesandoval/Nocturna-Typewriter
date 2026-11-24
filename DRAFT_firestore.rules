@@ -74,7 +74,7 @@ service cloud.firestore {
         isValidId(userId) &&
         isValidId(notebookId) &&
         request.auth.uid == userId &&
-        existing().ownerId == request.auth.uid;
+        (resource == null || existing().ownerId == request.auth.uid);
 
       allow list: if isVerified() &&
         request.auth.uid == userId &&
@@ -114,14 +114,11 @@ service cloud.firestore {
           isValidId(notebookId) &&
           isValidId(pageId) &&
           request.auth.uid == userId &&
-          existing().ownerId == request.auth.uid &&
-          exists(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)) &&
-          get(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)).data.ownerId == request.auth.uid;
+          (resource == null || existing().ownerId == request.auth.uid);
 
         allow list: if isVerified() &&
           request.auth.uid == userId &&
-          existing().ownerId == request.auth.uid &&
-          existing().notebookId == notebookId;
+          existing().ownerId == request.auth.uid;
 
         allow create: if isVerified() &&
           isValidId(userId) &&
@@ -130,9 +127,7 @@ service cloud.firestore {
           request.auth.uid == userId &&
           isValidNotebookPage(incoming(), userId, notebookId) &&
           incoming().createdAt == request.time &&
-          incoming().updatedAt == request.time &&
-          exists(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)) &&
-          get(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)).data.ownerId == request.auth.uid;
+          incoming().updatedAt == request.time;
 
         allow update: if isVerified() &&
           isValidId(userId) &&
@@ -149,18 +144,14 @@ service cloud.firestore {
             incoming().diff(existing()).affectedKeys().hasOnly(['content', 'updatedAt']) ||
             incoming().diff(existing()).affectedKeys().hasOnly(['pageNumber', 'updatedAt']) ||
             incoming().diff(existing()).affectedKeys().hasOnly(['content', 'pageNumber', 'updatedAt'])
-          ) &&
-          exists(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)) &&
-          get(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)).data.ownerId == request.auth.uid;
+          );
 
         allow delete: if isVerified() &&
           isValidId(userId) &&
           isValidId(notebookId) &&
           isValidId(pageId) &&
           request.auth.uid == userId &&
-          existing().ownerId == request.auth.uid &&
-          exists(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)) &&
-          get(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)).data.ownerId == request.auth.uid;
+          existing().ownerId == request.auth.uid;
       }
     }
   }

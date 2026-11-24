@@ -69,6 +69,7 @@ import {
   ParsedAuthError,
   signOutUser,
   loadUserNotebooksFromCloud,
+  subscribeToUserNotebooks,
   saveNotebookToCloud,
   deleteNotebookFromCloud,
   deletePageFromCloud,
@@ -160,11 +161,18 @@ export default function App() {
       });
   }, []);
 
-  // Listen for Firebase Auth state changes and merge/sync notebooks with Firestore
+  // Listen for Firebase Auth state changes and synchronize notebooks in real-time across PC & Tablet
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+    let unsubscribeSnapshot: (() => void) | null = null;
+
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
       setCurrentUser(user);
       setIsAuthReady(true);
+
+      if (unsubscribeSnapshot) {
+        unsubscribeSnapshot();
+        unsubscribeSnapshot = null;
+      }
 
       if (user && initialCloudLoadDoneRef.current !== user.uid) {
         initialCloudLoadDoneRef.current = user.uid;
@@ -173,13 +181,10 @@ export default function App() {
           const cloudNotebooks = await loadUserNotebooksFromCloud(user.uid);
           const localNotebooks = loadNotebooks();
 
-          // Keep any local notebooks where the user has actually written something
-          // or explicitly created a book/page
+          // Upload any local notebooks that actually have written text and do not exist in the cloud yet
           const writtenLocal = localNotebooks
-            .filter(
-              (n) =>
-                !n.id.startsWith('draft-') ||
-                n.pages.some((p) => p.content.trim().length > 0)
+            .filter((n) =>
+              n.pages.some((p) => p.content.trim().length > 0)
             )
             .map((n) => ({
               ...n,
@@ -189,40 +194,32 @@ export default function App() {
             }));
 
           const cloudMap = new Map(cloudNotebooks.map((n) => [n.id, n]));
-
-          // Merge local notebooks with cloud notebooks: if a local notebook is newer or not in cloud, upload it
-          const mergedMap = new Map<string, Notebook>(cloudMap);
           for (const localNb of writtenLocal) {
             const existingCloud = cloudMap.get(localNb.id);
-            if (!existingCloud || localNb.updatedAt >= existingCloud.updatedAt) {
-              mergedMap.set(localNb.id, localNb);
+            if (!existingCloud) {
               await saveNotebookToCloud(user.uid, localNb);
+              cloudMap.set(localNb.id, localNb);
             }
           }
 
-          const mergedList = Array.from(mergedMap.values()).sort(
-            (a, b) => b.updatedAt - a.updatedAt
-          );
+          // Re-fetch authoritative list from cloud so PC and Tablet see the exact same pages
+          const authoritativeCloud = await loadUserNotebooksFromCloud(user.uid);
+          const finalList =
+            authoritativeCloud.length > 0
+              ? authoritativeCloud
+              : Array.from(cloudMap.values()).sort(
+                  (a, b) => b.updatedAt - a.updatedAt
+                );
 
-          if (mergedList.length > 0) {
-            // Preserve the currently active written notebook if present, otherwise open the most recently written notebook
-            setNotebooks(mergedList);
-            setPrefs((prev) => {
-              const normalizedPrevId = prev.activeNotebookId.replace(
-                /^draft-/,
-                'note-'
-              );
-              const target =
-                mergedList.find((n) => n.id === normalizedPrevId) ||
-                mergedList[0];
-              return {
-                ...prev,
-                activeNotebookId: target.id,
-                activePageIndex: 0,
-              };
-            });
+          if (finalList.length > 0) {
+            // Switch directly to the account's most recent cloud page so logging in on Tablet shows the account's pages
+            setNotebooks(finalList);
+            setPrefs((prev) => ({
+              ...prev,
+              activeNotebookId: finalList[0].id,
+              activePageIndex: 0,
+            }));
           } else {
-            // User has zero saved pages in local or cloud — start with an empty blank desk
             const freshDraft = createBlankDraftNotebook();
             setNotebooks([freshDraft]);
             setPrefs((prev) => ({
@@ -232,6 +229,29 @@ export default function App() {
             }));
           }
           setCloudSyncState('synced');
+
+          // Real-time listener: when PC or Tablet saves a page, update the other device automatically
+          unsubscribeSnapshot = subscribeToUserNotebooks(
+            user.uid,
+            (liveCloudNotebooks) => {
+              if (liveCloudNotebooks.length === 0) return;
+              setNotebooks((prevLocal) => {
+                const liveMap = new Map(
+                  liveCloudNotebooks.map((n) => [n.id, n])
+                );
+                // Keep any brand-new local draft currently being typed
+                for (const loc of prevLocal) {
+                  const existing = liveMap.get(loc.id);
+                  if (!existing || loc.updatedAt > existing.updatedAt + 1500) {
+                    liveMap.set(loc.id, loc);
+                  }
+                }
+                return Array.from(liveMap.values()).sort(
+                  (a, b) => b.updatedAt - a.updatedAt
+                );
+              });
+            }
+          );
         } catch (err) {
           console.error('Error syncing notebooks with Google Cloud:', err);
           setCloudSyncState('error');
@@ -242,7 +262,10 @@ export default function App() {
       }
     });
 
-    return () => unsubscribe();
+    return () => {
+      if (unsubscribeSnapshot) unsubscribeSnapshot();
+      unsubscribeAuth();
+    };
   }, []);
 
   // Persist notebooks locally and schedule debounced cloud save when authenticated
@@ -1279,33 +1302,51 @@ export default function App() {
                     if (!currentUser) return;
                     setCloudSyncState('syncing');
                     try {
+                      // 1. Fetch authoritative notebooks from Google Cloud first
+                      const cloudNotebooks = await loadUserNotebooksFromCloud(
+                        currentUser.uid
+                      );
+                      const cloudMap = new Map(
+                        cloudNotebooks.map((n) => [n.id, n])
+                      );
+
+                      // 2. Upload any written local notebooks that are newer or not yet in cloud
                       for (const nb of notebooks) {
                         const hasText = nb.pages.some(
                           (p) => p.content.trim().length > 0
                         );
-                        if (!nb.id.startsWith('draft-') || hasText) {
-                          await saveNotebookToCloud(currentUser.uid, nb);
+                        if (hasText) {
+                          const normId = nb.id.startsWith('draft-')
+                            ? nb.id.replace(/^draft-/, 'note-')
+                            : nb.id;
+                          const existingCloud = cloudMap.get(normId);
+                          if (
+                            !existingCloud ||
+                            nb.updatedAt > existingCloud.updatedAt
+                          ) {
+                            await saveNotebookToCloud(currentUser.uid, {
+                              ...nb,
+                              id: normId,
+                            });
+                          }
                         }
                       }
-                      const cloudNotebooks = await loadUserNotebooksFromCloud(
+
+                      // 3. Re-fetch complete unified list from server and switch directly to the account's latest page
+                      const unifiedCloud = await loadUserNotebooksFromCloud(
                         currentUser.uid
                       );
-                      if (cloudNotebooks.length > 0) {
-                        setNotebooks(cloudNotebooks);
-                        setPrefs((prev) => {
-                          const target =
-                            cloudNotebooks.find(
-                              (n) =>
-                                n.id ===
-                                prev.activeNotebookId.replace(/^draft-/, 'note-')
-                            ) || cloudNotebooks[0];
-                          return {
-                            ...prev,
-                            activeNotebookId: target.id,
-                          };
-                        });
+                      if (unifiedCloud.length > 0) {
+                        setNotebooks(unifiedCloud);
+                        setPrefs((prev) => ({
+                          ...prev,
+                          activeNotebookId: unifiedCloud[0].id,
+                          activePageIndex: 0,
+                        }));
                       }
                       setCloudSyncState('synced');
+                      setAuthBanner('Sincronizado con la nube');
+                      window.setTimeout(() => setAuthBanner(null), 2500);
                     } catch (err) {
                       console.error('Manual cloud sync error:', err);
                       setCloudSyncState('error');

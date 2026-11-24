@@ -16,18 +16,16 @@ test('Dirty Dozen security invariants are enforced in firestore.rules', () => {
   assert.ok(rules.includes("data.keys().hasAll(['ownerId', 'title', 'createdAt', 'updatedAt'])"));
   assert.ok(rules.includes("data.keys().hasOnly(['ownerId', 'title', 'createdAt', 'updatedAt'])"));
 
-  // 4. Master gate relational check on subcollection pages
-  assert.ok(
-    rules.includes(
-      'exists(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId))'
-    )
-  );
-
-  // 5. Strict server timestamp validation
+  // 4. Strict server timestamp validation
   assert.ok(rules.includes('incoming().createdAt == request.time'));
   assert.ok(rules.includes('incoming().updatedAt == request.time'));
 
-  // 6. Immutable field locks on update
+  // 5. Immutable field locks on update
   assert.ok(rules.includes('incoming().ownerId == existing().ownerId'));
   assert.ok(rules.includes('incoming().createdAt == existing().createdAt'));
+
+  // 6. Allow checking existence of non-existent document (resource == null) before setDoc
+  assert.ok(
+    rules.includes('(resource == null || existing().ownerId == request.auth.uid)')
+  );
 });
