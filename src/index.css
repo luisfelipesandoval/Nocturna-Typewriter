@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --font-display: 'Fraunces', Georgia, serif;
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #14110F;
+    color: #F2E9D8;
+    overflow-x: hidden;
+  }
+}
+
+.font-typewriter {
+  font-family: var(--font-mono);
+  font-feature-settings: "liga" 0;
+}
+
+.font-editorial {
+  font-family: var(--font-display);
+}
+
+@keyframes carriagePulseIdle {
+  0%, 100% {
+    opacity: 0.72;
+    transform: scaleX(0.98) scaleY(0.96);
+  }
+  50% {
+    opacity: 1;
+    transform: scaleX(1.03) scaleY(1.04);
+  }
+}
+
+@keyframes carriageTypingFlash {
+  0% {
+    opacity: 1;
+    transform: scaleX(1.06) scaleY(1.08);
+  }
+  100% {
+    opacity: 0.9;
+    transform: scaleX(1) scaleY(1);
+  }
+}
+
+.animate-carriage-idle {
+  animation: carriagePulseIdle 3.2s ease-in-out infinite;
+}
+
+.animate-carriage-typing {
+  animation: carriageTypingFlash 0.16s ease-out forwards;
+}
+
+/* Custom subtle scrollbars for panels */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #181412;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #362E29;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4E423B;
+}

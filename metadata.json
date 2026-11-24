@@ -1,0 +1,6 @@
+{
+  "name": "Nocturna Typewriter — Bloc de Notas y Escritura Libre",
+  "description": "Cuaderno nocturno de escritura libre inspirado en una máquina de escribir clásica con carro de luz cálida, paso automático de páginas y sonidos ambientales envolventes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
