@@ -1,0 +1,167 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 4.1: Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Phase 3: Hardened Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Validation Blueprint: Notebook
+    function isValidNotebook(data, userId) {
+      return data.keys().hasAll(['ownerId', 'title', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'title', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.ownerId == userId &&
+        data.title is string &&
+        data.title.size() >= 1 &&
+        data.title.size() <= 200 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: NotebookPage
+    function isValidNotebookPage(data, userId, notebookId) {
+      return data.keys().hasAll(['ownerId', 'notebookId', 'pageNumber', 'content', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'notebookId', 'pageNumber', 'content', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.ownerId == userId &&
+        data.notebookId is string &&
+        data.notebookId.size() >= 1 &&
+        data.notebookId.size() <= 128 &&
+        data.notebookId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.notebookId == notebookId &&
+        data.pageNumber is int &&
+        data.pageNumber >= 0 &&
+        data.pageNumber <= 10000 &&
+        data.content is string &&
+        data.content.size() <= 50000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    match /users/{userId}/notebooks/{notebookId} {
+      allow get: if isVerified() &&
+        isValidId(userId) &&
+        isValidId(notebookId) &&
+        request.auth.uid == userId &&
+        existing().ownerId == request.auth.uid;
+
+      allow list: if isVerified() &&
+        request.auth.uid == userId &&
+        existing().ownerId == request.auth.uid;
+
+      allow create: if isVerified() &&
+        isValidId(userId) &&
+        isValidId(notebookId) &&
+        request.auth.uid == userId &&
+        isValidNotebook(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerified() &&
+        isValidId(userId) &&
+        isValidId(notebookId) &&
+        request.auth.uid == userId &&
+        isValidNotebook(incoming(), userId) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['title', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['updatedAt'])
+        );
+
+      allow delete: if isVerified() &&
+        isValidId(userId) &&
+        isValidId(notebookId) &&
+        request.auth.uid == userId &&
+        existing().ownerId == request.auth.uid;
+
+      match /pages/{pageId} {
+        allow get: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(notebookId) &&
+          isValidId(pageId) &&
+          request.auth.uid == userId &&
+          existing().ownerId == request.auth.uid &&
+          exists(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)) &&
+          get(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)).data.ownerId == request.auth.uid;
+
+        allow list: if isVerified() &&
+          request.auth.uid == userId &&
+          existing().ownerId == request.auth.uid &&
+          existing().notebookId == notebookId;
+
+        allow create: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(notebookId) &&
+          isValidId(pageId) &&
+          request.auth.uid == userId &&
+          isValidNotebookPage(incoming(), userId, notebookId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)) &&
+          get(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)).data.ownerId == request.auth.uid;
+
+        allow update: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(notebookId) &&
+          isValidId(pageId) &&
+          request.auth.uid == userId &&
+          isValidNotebookPage(incoming(), userId, notebookId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().notebookId == existing().notebookId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['content', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['pageNumber', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['content', 'pageNumber', 'updatedAt'])
+          ) &&
+          exists(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)) &&
+          get(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)).data.ownerId == request.auth.uid;
+
+        allow delete: if isVerified() &&
+          isValidId(userId) &&
+          isValidId(notebookId) &&
+          isValidId(pageId) &&
+          request.auth.uid == userId &&
+          existing().ownerId == request.auth.uid &&
+          exists(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)) &&
+          get(/databases/$(database)/documents/users/$(userId)/notebooks/$(notebookId)).data.ownerId == request.auth.uid;
+      }
+    }
+  }
+}

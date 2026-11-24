@@ -114,7 +114,7 @@ export function loadPreferences(defaultNotebookId: string): UserPreferences {
     activePageIndex: 0,
     maxLinesPerPage: 16,
     autoTurnPages: true,
-    showRuledLines: true,
+    showRuledLines: false,
     lampIntensity: 'calida',
     masterKeyVolume: 0.65,
     masterAmbientVolume: 0.55,

@@ -1,0 +1,87 @@
+{
+  "entities": {
+    "Notebook": {
+      "title": "Notebook",
+      "description": "A user's typewriter notebook container stored in the cloud.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "The UID of the authenticated owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "The title of the notebook.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the notebook was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the notebook was last updated."
+        }
+      },
+      "required": ["ownerId", "title", "createdAt", "updatedAt"]
+    },
+    "NotebookPage": {
+      "title": "NotebookPage",
+      "description": "An individual sheet inside a typewriter notebook.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "The UID of the authenticated owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "notebookId": {
+          "type": "string",
+          "description": "The ID of the parent notebook document.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "pageNumber": {
+          "type": "number",
+          "description": "Zero-indexed page order within the notebook."
+        },
+        "content": {
+          "type": "string",
+          "description": "Text written on this typewriter sheet.",
+          "minLength": 0,
+          "maxLength": 50000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the page was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the page was last modified."
+        }
+      },
+      "required": ["ownerId", "notebookId", "pageNumber", "content", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/notebooks/{notebookId}": {
+      "schema": { "$ref": "#/entities/Notebook" },
+      "description": "User-owned typewriter notebooks."
+    },
+    "/users/{userId}/notebooks/{notebookId}/pages/{pageId}": {
+      "schema": { "$ref": "#/entities/NotebookPage" },
+      "description": "Individual sheets belonging to a user's typewriter notebook."
+    }
+  }
+}

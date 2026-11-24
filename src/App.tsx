@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CloudRain,
   TrainFront,
@@ -11,6 +11,9 @@ import {
   Minimize2,
   Sliders,
   BookOpen,
+  Cloud,
+  LogIn,
+  LogOut,
 } from 'lucide-react';
 import {
   calculateTextMetrics,
@@ -30,6 +33,17 @@ import {
   savePreferences,
   UserPreferences,
 } from './utils/storage';
+import {
+  auth,
+  onAuthStateChanged,
+  signInWithGoogle,
+  signOutUser,
+  loadUserNotebooksFromCloud,
+  saveNotebookToCloud,
+  deleteNotebookFromCloud,
+  deletePageFromCloud,
+  User,
+} from './utils/firebase';
 import { TypewriterSheet } from './components/TypewriterSheet';
 import { NotebookOrganizer } from './components/NotebookOrganizer';
 import { AmbientSoundPanel } from './components/AmbientSoundPanel';
@@ -42,10 +56,20 @@ export default function App() {
     loadPreferences(loadNotebooks()[0]?.id || 'nb-bitacora-nocturna')
   );
 
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [cloudSyncState, setCloudSyncState] = useState<
+    'idle' | 'syncing' | 'synced' | 'error'
+  >('idle');
+  const [authBanner, setAuthBanner] = useState<string | null>(null);
+
   const [isOrganizerOpen, setIsOrganizerOpen] = useState(false);
   const [isSoundPanelOpen, setIsSoundPanelOpen] = useState(false);
   const [isDistractionFree, setIsDistractionFree] = useState(false);
   const [autoTurnBanner, setAutoTurnBanner] = useState<string | null>(null);
+
+  const cloudSaveTimerRef = useRef<number | null>(null);
+  const initialCloudLoadDoneRef = useRef<string | null>(null);
 
   // Ensure activeNotebook always resolves to a valid notebook
   const activeNotebook = useMemo(() => {
@@ -59,10 +83,76 @@ export default function App() {
     return Math.min(Math.max(0, prefs.activePageIndex), maxIdx);
   }, [activeNotebook, prefs.activePageIndex]);
 
-  // Persist notebooks and preferences on change
+  // Listen for Firebase Auth state changes and merge/sync notebooks with Firestore
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setCurrentUser(user);
+      setIsAuthReady(true);
+
+      if (user && initialCloudLoadDoneRef.current !== user.uid) {
+        initialCloudLoadDoneRef.current = user.uid;
+        setCloudSyncState('syncing');
+        try {
+          const cloudNotebooks = await loadUserNotebooksFromCloud(user.uid);
+          const localNotebooks = loadNotebooks();
+
+          if (cloudNotebooks.length > 0) {
+            // Merge any local notebooks that don't exist in cloud yet
+            const cloudIds = new Set(cloudNotebooks.map((n) => n.id));
+            const unsyncedLocal = localNotebooks.filter(
+              (n) => !cloudIds.has(n.id)
+            );
+            for (const localNb of unsyncedLocal) {
+              await saveNotebookToCloud(user.uid, localNb);
+            }
+            const combined = [...cloudNotebooks, ...unsyncedLocal];
+            setNotebooks(combined);
+          } else {
+            // Upload current local notebooks so user doesn't lose what they wrote
+            for (const nb of localNotebooks) {
+              await saveNotebookToCloud(user.uid, nb);
+            }
+          }
+          setCloudSyncState('synced');
+        } catch (err) {
+          console.error('Error syncing notebooks with Google Cloud:', err);
+          setCloudSyncState('error');
+        }
+      } else if (!user) {
+        initialCloudLoadDoneRef.current = null;
+        setCloudSyncState('idle');
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Persist notebooks locally and schedule debounced cloud save when authenticated
   useEffect(() => {
     saveNotebooks(notebooks);
-  }, [notebooks]);
+
+    if (!isAuthReady || !currentUser || !activeNotebook) return;
+    if (cloudSaveTimerRef.current) {
+      window.clearTimeout(cloudSaveTimerRef.current);
+    }
+
+    setCloudSyncState('syncing');
+    cloudSaveTimerRef.current = window.setTimeout(async () => {
+      try {
+        await saveNotebookToCloud(currentUser.uid, activeNotebook);
+        setCloudSyncState('synced');
+      } catch (err) {
+        console.error('Error saving active notebook to Firestore:', err);
+        setCloudSyncState('error');
+      }
+    }, 650);
+
+    return () => {
+      if (cloudSaveTimerRef.current) {
+        window.clearTimeout(cloudSaveTimerRef.current);
+      }
+    };
+  }, [notebooks, activeNotebook, currentUser, isAuthReady]);
 
   useEffect(() => {
     savePreferences(prefs);
@@ -86,26 +176,45 @@ export default function App() {
     prefs.ambientTracks,
   ]);
 
-  // Listen for browser Fullscreen changes or Escape key
+  // Listen for Escape key to close drawers
   useEffect(() => {
-    const handleFullscreenChange = () => {
-      if (!document.fullscreenElement && isDistractionFree) {
-        // Keep internal distraction-free state synced if user exits native fullscreen via Esc
-      }
-    };
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         if (isOrganizerOpen) setIsOrganizerOpen(false);
         if (isSoundPanelOpen) setIsSoundPanelOpen(false);
       }
     };
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
     window.addEventListener('keydown', handleKeyDown);
-    return () => {
-      document.removeEventListener('fullscreenchange', handleFullscreenChange);
-      window.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [isDistractionFree, isOrganizerOpen, isSoundPanelOpen]);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOrganizerOpen, isSoundPanelOpen]);
+
+  const handleGoogleAuthClick = async () => {
+    if (currentUser) {
+      try {
+        await signOutUser();
+        setAuthBanner('Sesión de Google cerrada · Guardado local activo');
+        window.setTimeout(() => setAuthBanner(null), 3500);
+      } catch (err) {
+        console.error('Sign-out error:', err);
+      }
+    } else {
+      try {
+        setCloudSyncState('syncing');
+        const user = await signInWithGoogle();
+        setAuthBanner(
+          `Conectado con Google (${user.displayName || user.email})`
+        );
+        window.setTimeout(() => setAuthBanner(null), 3500);
+      } catch (err) {
+        console.error('Google Sign-In error:', err);
+        setCloudSyncState('idle');
+        setAuthBanner(
+          'No se pudo completar el acceso con Google (ventana cerrada)'
+        );
+        window.setTimeout(() => setAuthBanner(null), 3500);
+      }
+    }
+  };
 
   const triggerAutoTurnNotification = useCallback((newPageNumber: number) => {
     setAutoTurnBanner(`Paso automático a la Hoja ${newPageNumber}`);
@@ -188,7 +297,6 @@ export default function App() {
       }
     }
 
-    // Normal in-page update
     const now = Date.now();
     setNotebooks((prev) =>
       prev.map((nb) => {
@@ -205,7 +313,10 @@ export default function App() {
 
   const handleSelectPage = (index: number) => {
     if (!activeNotebook) return;
-    const clamped = Math.max(0, Math.min(index, activeNotebook.pages.length - 1));
+    const clamped = Math.max(
+      0,
+      Math.min(index, activeNotebook.pages.length - 1)
+    );
     if (clamped !== activePageIndex) {
       soundEngine.playKeySound('pageturn');
     }
@@ -244,7 +355,10 @@ export default function App() {
     handleDeletePageFromNotebook(activeNotebook.id, activePageIndex);
   };
 
-  const handleSelectNotebookAndPage = (notebookId: string, pageIndex: number) => {
+  const handleSelectNotebookAndPage = (
+    notebookId: string,
+    pageIndex: number
+  ) => {
     soundEngine.playKeySound('pageturn');
     setPrefs((prev) => ({
       ...prev,
@@ -277,8 +391,9 @@ export default function App() {
     }));
   };
 
-  const handleDeleteNotebook = (notebookId: string) => {
+  const handleDeleteNotebook = async (notebookId: string) => {
     if (notebooks.length <= 1) return;
+    const targetNb = notebooks.find((nb) => nb.id === notebookId);
     const remaining = notebooks.filter((nb) => nb.id !== notebookId);
     setNotebooks(remaining);
     if (prefs.activeNotebookId === notebookId) {
@@ -287,6 +402,13 @@ export default function App() {
         activeNotebookId: remaining[0].id,
         activePageIndex: 0,
       }));
+    }
+    if (currentUser && targetNb) {
+      try {
+        await deleteNotebookFromCloud(currentUser.uid, targetNb);
+      } catch (err) {
+        console.error('Error deleting notebook from Firestore:', err);
+      }
     }
   };
 
@@ -319,10 +441,13 @@ export default function App() {
     }));
   };
 
-  const handleDeletePageFromNotebook = (
+  const handleDeletePageFromNotebook = async (
     notebookId: string,
     pageIndex: number
   ) => {
+    const targetNb = notebooks.find((n) => n.id === notebookId);
+    const targetPage = targetNb?.pages[pageIndex];
+
     setNotebooks((prev) =>
       prev.map((nb) => {
         if (nb.id !== notebookId || nb.pages.length <= 1) return nb;
@@ -337,8 +462,18 @@ export default function App() {
     if (prefs.activeNotebookId === notebookId) {
       setPrefs((prev) => ({
         ...prev,
-        activePageIndex: Math.max(0, Math.min(prev.activePageIndex, pageIndex - 1)),
+        activePageIndex: Math.max(
+          0,
+          Math.min(prev.activePageIndex, pageIndex - 1)
+        ),
       }));
+    }
+    if (currentUser && targetPage) {
+      try {
+        await deletePageFromCloud(currentUser.uid, notebookId, targetPage.id);
+      } catch (err) {
+        console.error('Error deleting page from Firestore:', err);
+      }
     }
   };
 
@@ -462,6 +597,20 @@ export default function App() {
     { id: 'chimenea', label: 'Hoguera', icon: Flame },
   ];
 
+  const cloudStatusLabel = useMemo(() => {
+    if (authBanner) return authBanner;
+    if (!currentUser) {
+      return 'Guardado local · Ingresa con Google para guardar en la nube';
+    }
+    if (cloudSyncState === 'syncing') {
+      return 'Sincronizando con tu cuenta de Google...';
+    }
+    if (cloudSyncState === 'error') {
+      return 'Guardado en navegador (reintentando nube)';
+    }
+    return `Guardado en Google (${currentUser.displayName || currentUser.email})`;
+  }, [authBanner, currentUser, cloudSyncState]);
+
   return (
     <div className="min-h-screen bg-[#14110F] text-[#F2E9D8] flex flex-col relative selection:bg-[#D99B4E]/30">
       {/* Subtle Warm Desk Ambient Radial Vignette */}
@@ -490,7 +639,7 @@ export default function App() {
             Nocturna
           </a>
 
-          {/* Zone 2: 4 concise single-line text navigation links */}
+          {/* Zone 2: 5 concise single-line text navigation links */}
           <nav
             aria-label="Navegación principal"
             className="flex items-center gap-6 text-sm font-medium text-[#BFB09E]"
@@ -534,16 +683,41 @@ export default function App() {
             >
               Renglones
             </button>
-          </nav>
-
-          {/* Zone 3: 1 primary action */}
-          <div className="flex items-center shrink-0">
             <button
               type="button"
               onClick={toggleDistractionFree}
-              className="px-4 py-2 text-xs font-medium text-[#171310] bg-[#D99B4E] rounded-lg hover:bg-[#E6A95C] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              className="hover:text-[#F5ECD9] hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               Pantalla Completa
+            </button>
+          </nav>
+
+          {/* Zone 3: 1 primary action (Google Sign-In / Cloud Sync Account) */}
+          <div className="flex items-center shrink-0">
+            <button
+              type="button"
+              onClick={handleGoogleAuthClick}
+              data-testid="google-auth-button"
+              className={`inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                currentUser
+                  ? 'bg-[#251F1B] border border-[#46392F] text-[#F2E9D8] hover:bg-[#312923]'
+                  : 'bg-[#D99B4E] text-[#171310] hover:bg-[#E6A95C]'
+              }`}
+            >
+              {currentUser ? (
+                <>
+                  <Cloud className="w-3.5 h-3.5 text-[#E8A856]" />
+                  <span>
+                    {currentUser.displayName?.split(' ')[0] || 'Conectado'} · Salir
+                  </span>
+                  <LogOut className="w-3.5 h-3.5 text-[#A89A8A]" />
+                </>
+              ) : (
+                <>
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>Ingresar con Google</span>
+                </>
+              )}
             </button>
           </div>
         </header>
@@ -582,7 +756,7 @@ export default function App() {
       >
         {/* Discreet Quick-Access Bar for Ambient Sounds & Organizer */}
         {!isDistractionFree && (
-          <div className="w-full max-w-[820px] mx-auto mb-5 flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-[#1A1613] border border-[#2C241E]">
+          <div className="w-full max-w-[840px] mx-auto mb-5 flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-[#1A1613] border border-[#2C241E]">
             {/* Left: Quick ambient sound toggles */}
             <div
               className="flex flex-wrap sm:flex-nowrap items-center gap-1.5"
@@ -677,6 +851,7 @@ export default function App() {
             isDistractionFree={isDistractionFree}
             metrics={currentMetrics}
             autoTurnBanner={autoTurnBanner}
+            cloudStatusLabel={cloudStatusLabel}
             onUpdateTitle={handleUpdateTitle}
             onUpdatePageContent={handleUpdatePageContent}
             onSelectPage={handleSelectPage}
@@ -688,7 +863,7 @@ export default function App() {
         )}
 
         {/* Quiet Footer */}
-        <footer className="w-full max-w-[820px] mx-auto mt-8 pt-3 flex flex-wrap items-center justify-between gap-4 text-xs text-[#6E6155]">
+        <footer className="w-full max-w-[840px] mx-auto mt-8 pt-3 flex flex-wrap items-center justify-between gap-4 text-xs text-[#6E6155]">
           <div>
             Nocturna · Máquina de escribir y bloc de hojas con foco de lectura
           </div>
@@ -730,7 +905,11 @@ export default function App() {
         onChangeTrackVolume={handleChangeTrackVolume}
         onApplyPreset={handleApplyPreset}
         onChangeMasterKeyVolume={(vol) =>
-          setPrefs((prev) => ({ ...prev, masterKeyVolume: vol, keyMuted: false }))
+          setPrefs((prev) => ({
+            ...prev,
+            masterKeyVolume: vol,
+            keyMuted: false,
+          }))
         }
         onChangeMasterAmbientVolume={(vol) =>
           setPrefs((prev) => ({
@@ -752,7 +931,10 @@ export default function App() {
           setPrefs((prev) => ({ ...prev, autoTurnPages: !prev.autoTurnPages }))
         }
         onToggleRuledLines={() =>
-          setPrefs((prev) => ({ ...prev, showRuledLines: !prev.showRuledLines }))
+          setPrefs((prev) => ({
+            ...prev,
+            showRuledLines: !prev.showRuledLines,
+          }))
         }
         onChangeLampIntensity={(intensity) =>
           setPrefs((prev) => ({ ...prev, lampIntensity: intensity }))
