@@ -173,28 +173,64 @@ export default function App() {
           const cloudNotebooks = await loadUserNotebooksFromCloud(user.uid);
           const localNotebooks = loadNotebooks();
 
-          // Keep only local notebooks where the user has actually written something
-          const writtenLocal = localNotebooks.filter((n) =>
-            n.pages.some((p) => p.content.trim().length > 0)
-          );
+          // Keep any local notebooks where the user has actually written something
+          // or explicitly created a book/page
+          const writtenLocal = localNotebooks
+            .filter(
+              (n) =>
+                !n.id.startsWith('draft-') ||
+                n.pages.some((p) => p.content.trim().length > 0)
+            )
+            .map((n) => ({
+              ...n,
+              id: n.id.startsWith('draft-')
+                ? n.id.replace(/^draft-/, 'note-')
+                : n.id,
+            }));
 
-          const cloudIds = new Set(cloudNotebooks.map((n) => n.id));
-          const unsyncedLocal = writtenLocal.filter((n) => !cloudIds.has(n.id));
+          const cloudMap = new Map(cloudNotebooks.map((n) => [n.id, n]));
 
-          for (const localNb of unsyncedLocal) {
-            await saveNotebookToCloud(user.uid, localNb);
+          // Merge local notebooks with cloud notebooks: if a local notebook is newer or not in cloud, upload it
+          const mergedMap = new Map<string, Notebook>(cloudMap);
+          for (const localNb of writtenLocal) {
+            const existingCloud = cloudMap.get(localNb.id);
+            if (!existingCloud || localNb.updatedAt >= existingCloud.updatedAt) {
+              mergedMap.set(localNb.id, localNb);
+              await saveNotebookToCloud(user.uid, localNb);
+            }
           }
 
-          // Always start login session on a fresh blank draft sheet on the desk,
-          // while keeping any saved cloud notebooks in Tu biblioteca
-          const freshDraft = createBlankDraftNotebook();
-          const combined = [freshDraft, ...cloudNotebooks, ...unsyncedLocal];
-          setNotebooks(combined);
-          setPrefs((prev) => ({
-            ...prev,
-            activeNotebookId: freshDraft.id,
-            activePageIndex: 0,
-          }));
+          const mergedList = Array.from(mergedMap.values()).sort(
+            (a, b) => b.updatedAt - a.updatedAt
+          );
+
+          if (mergedList.length > 0) {
+            // Preserve the currently active written notebook if present, otherwise open the most recently written notebook
+            setNotebooks(mergedList);
+            setPrefs((prev) => {
+              const normalizedPrevId = prev.activeNotebookId.replace(
+                /^draft-/,
+                'note-'
+              );
+              const target =
+                mergedList.find((n) => n.id === normalizedPrevId) ||
+                mergedList[0];
+              return {
+                ...prev,
+                activeNotebookId: target.id,
+                activePageIndex: 0,
+              };
+            });
+          } else {
+            // User has zero saved pages in local or cloud — start with an empty blank desk
+            const freshDraft = createBlankDraftNotebook();
+            setNotebooks([freshDraft]);
+            setPrefs((prev) => ({
+              ...prev,
+              activeNotebookId: freshDraft.id,
+              activePageIndex: 0,
+            }));
+          }
           setCloudSyncState('synced');
         } catch (err) {
           console.error('Error syncing notebooks with Google Cloud:', err);
@@ -234,7 +270,7 @@ export default function App() {
         console.error('Error saving active notebook to Firestore:', err);
         setCloudSyncState('error');
       }
-    }, 650);
+    }, 350);
 
     return () => {
       if (cloudSaveTimerRef.current) {
@@ -367,6 +403,16 @@ export default function App() {
   const handleUpdatePageContent = (newContent: string) => {
     if (!activeNotebook) return;
 
+    const hasWrittenText =
+      newContent.trim().length > 0 ||
+      activeNotebook.pages.some(
+        (p, idx) => idx !== activePageIndex && p.content.trim().length > 0
+      );
+    const promotedId =
+      hasWrittenText && activeNotebook.id.startsWith('draft-')
+        ? activeNotebook.id.replace(/^draft-/, 'note-')
+        : activeNotebook.id;
+
     if (prefs.autoTurnPages) {
       const overflow = evaluatePageOverflow(
         newContent,
@@ -414,6 +460,7 @@ export default function App() {
 
             return {
               ...nb,
+              id: promotedId,
               title: autoTitle,
               updatedAt: now,
               pages: updatedPages,
@@ -423,6 +470,7 @@ export default function App() {
 
         setPrefs((prev) => ({
           ...prev,
+          activeNotebookId: promotedId,
           activePageIndex: nextIndex,
         }));
         triggerAutoTurnNotification(nextIndex + 1);
@@ -445,12 +493,20 @@ export default function App() {
             : nb.title;
         return {
           ...nb,
+          id: promotedId,
           title: autoTitle,
           updatedAt: now,
           pages: updatedPages,
         };
       })
     );
+
+    if (promotedId !== activeNotebook.id) {
+      setPrefs((prev) => ({
+        ...prev,
+        activeNotebookId: promotedId,
+      }));
+    }
   };
 
   const handleSelectPage = (index: number) => {
@@ -1200,10 +1256,66 @@ export default function App() {
                   <div className="text-[11px] text-[#7D6B58] truncate">
                     {currentUser.email}
                   </div>
-                  <div className="mt-1.5 text-[11px] text-[#4C6B4A] font-medium">
-                    ✓ Sincronización en la nube activa
+                  <div
+                    className={`mt-1.5 text-[11px] font-medium ${
+                      cloudSyncState === 'error'
+                        ? 'text-[#A84A24]'
+                        : cloudSyncState === 'syncing'
+                        ? 'text-[#8C6D3F]'
+                        : 'text-[#4C6B4A]'
+                    }`}
+                  >
+                    {cloudSyncState === 'error'
+                      ? '⚠ Error al sincronizar en la nube'
+                      : cloudSyncState === 'syncing'
+                      ? '↻ Guardando cambios en la nube...'
+                      : '✓ Sincronización en la nube activa'}
                   </div>
                 </div>
+
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!currentUser) return;
+                    setCloudSyncState('syncing');
+                    try {
+                      for (const nb of notebooks) {
+                        const hasText = nb.pages.some(
+                          (p) => p.content.trim().length > 0
+                        );
+                        if (!nb.id.startsWith('draft-') || hasText) {
+                          await saveNotebookToCloud(currentUser.uid, nb);
+                        }
+                      }
+                      const cloudNotebooks = await loadUserNotebooksFromCloud(
+                        currentUser.uid
+                      );
+                      if (cloudNotebooks.length > 0) {
+                        setNotebooks(cloudNotebooks);
+                        setPrefs((prev) => {
+                          const target =
+                            cloudNotebooks.find(
+                              (n) =>
+                                n.id ===
+                                prev.activeNotebookId.replace(/^draft-/, 'note-')
+                            ) || cloudNotebooks[0];
+                          return {
+                            ...prev,
+                            activeNotebookId: target.id,
+                          };
+                        });
+                      }
+                      setCloudSyncState('synced');
+                    } catch (err) {
+                      console.error('Manual cloud sync error:', err);
+                      setCloudSyncState('error');
+                    }
+                  }}
+                  className="w-full flex items-center justify-center gap-2 py-2 rounded-full bg-[#FAF5EC] border border-[#D8CBB8] text-[#2F231A] font-medium hover:bg-[#EFE6D8] transition-colors cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5 text-[#8A5A36]" />
+                  <span>Sincronizar ahora</span>
+                </button>
 
                 <button
                   type="button"

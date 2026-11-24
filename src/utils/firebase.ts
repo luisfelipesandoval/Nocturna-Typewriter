@@ -239,6 +239,16 @@ export { onAuthStateChanged };
 export type { User };
 
 /**
+ * Converts a temporary draft-* ID into a permanent note-* ID once written.
+ */
+export function ensurePermanentNotebookId(id: string): string {
+  if (id.startsWith('draft-')) {
+    return id.replace(/^draft-/, 'note-');
+  }
+  return id;
+}
+
+/**
  * Loads all notebooks and their subcollection pages for the authenticated user.
  */
 export async function loadUserNotebooksFromCloud(
@@ -280,8 +290,11 @@ export async function loadUserNotebooksFromCloud(
 
         rawPages.sort((a, b) => a.pageNumber - b.pageNumber);
 
+        // Promote any previously saved draft-* ID to note-* so it is never filtered out
+        const normalizedId = ensurePermanentNotebookId(nbId);
+
         loaded.push({
-          id: nbId,
+          id: normalizedId,
           title:
             typeof nbData.title === 'string' ? nbData.title : 'Sin título',
           createdAt: nbData.createdAt?.toMillis?.() || Date.now(),
@@ -328,8 +341,9 @@ export async function saveNotebookToCloud(
     return;
   }
 
+  const permanentId = ensurePermanentNotebookId(notebook.id);
   const safeUid = sanitizeId(userId, 'u');
-  const safeNbId = sanitizeId(notebook.id, 'nb');
+  const safeNbId = sanitizeId(permanentId, 'nb');
   const nbDocPath = `users/${safeUid}/notebooks/${safeNbId}`;
   const nbRef = doc(db, nbDocPath);
 
