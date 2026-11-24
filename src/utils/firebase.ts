@@ -269,7 +269,7 @@ export async function loadUserNotebooksFromCloud(
     } catch {
       nbSnap = await getDocs(nbQuery);
     }
-    const loaded: Notebook[] = [];
+    const loadedMap = new Map<string, Notebook>();
 
     for (const nbDoc of nbSnap.docs) {
       const nbData = nbDoc.data();
@@ -304,8 +304,7 @@ export async function loadUserNotebooksFromCloud(
 
         // Promote any previously saved draft-* ID to note-* so it is never filtered out
         const normalizedId = ensurePermanentNotebookId(nbId);
-
-        loaded.push({
+        const candidateNb: Notebook = {
           id: normalizedId,
           title:
             typeof nbData.title === 'string' ? nbData.title : 'Sin título',
@@ -325,12 +324,18 @@ export async function loadUserNotebooksFromCloud(
                     updatedAt: Date.now(),
                   },
                 ],
-        });
+        };
+
+        const existing = loadedMap.get(normalizedId);
+        if (!existing || candidateNb.updatedAt >= existing.updatedAt) {
+          loadedMap.set(normalizedId, candidateNb);
+        }
       } catch (err) {
         handleFirestoreError(err, OperationType.LIST, pagesPath);
       }
     }
 
+    const loaded = Array.from(loadedMap.values());
     loaded.sort((a, b) => b.updatedAt - a.updatedAt);
     return loaded;
   } catch (error) {
@@ -339,7 +344,8 @@ export async function loadUserNotebooksFromCloud(
 }
 
 /**
- * Subscribes in real time to changes in the user's cloud notebooks across devices (e.g., PC <-> Tablet).
+ * Subscribes in real time to remote changes in the user's cloud notebooks across devices,
+ * ignoring local pending writes so typing is never interrupted.
  */
 export function subscribeToUserNotebooks(
   userId: string,
@@ -355,7 +361,11 @@ export function subscribeToUserNotebooks(
 
   return onSnapshot(
     nbQuery,
-    async () => {
+    async (snapshot) => {
+      // Ignore local pending writes to prevent self-echo loops while typing
+      if (snapshot.metadata.hasPendingWrites) {
+        return;
+      }
       try {
         const latest = await loadUserNotebooksFromCloud(userId);
         onUpdate(latest);
@@ -449,7 +459,8 @@ export async function deletePageFromCloud(
   pageId: string
 ): Promise<void> {
   const safeUid = sanitizeId(userId, 'u');
-  const safeNbId = sanitizeId(notebookId, 'nb');
+  const permanentId = ensurePermanentNotebookId(notebookId);
+  const safeNbId = sanitizeId(permanentId, 'nb');
   const safePageId = sanitizeId(pageId, 'pg');
   const pageDocPath = `users/${safeUid}/notebooks/${safeNbId}/pages/${safePageId}`;
   try {
@@ -464,22 +475,52 @@ export async function deleteNotebookFromCloud(
   notebook: Notebook
 ): Promise<void> {
   const safeUid = sanitizeId(userId, 'u');
-  const safeNbId = sanitizeId(notebook.id, 'nb');
+  const normalizedId = ensurePermanentNotebookId(notebook.id);
+  const legacyDraftId = normalizedId.startsWith('note-')
+    ? normalizedId.replace(/^note-/, 'draft-')
+    : notebook.id;
 
-  for (const page of notebook.pages) {
-    const safePageId = sanitizeId(page.id, 'pg');
-    const pagePath = `users/${safeUid}/notebooks/${safeNbId}/pages/${safePageId}`;
+  const candidateNbIds = Array.from(
+    new Set([
+      sanitizeId(normalizedId, 'nb'),
+      sanitizeId(legacyDraftId, 'nb'),
+      sanitizeId(notebook.id, 'nb'),
+    ])
+  );
+
+  for (const candNbId of candidateNbIds) {
+    const pagesPath = `users/${safeUid}/notebooks/${candNbId}/pages`;
+    // 1. Delete all pages found on the server in this notebook subcollection
     try {
-      await deleteDoc(doc(db, pagePath));
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, pagePath);
-    }
-  }
+      const pgQuery = query(
+        collection(db, pagesPath),
+        where('ownerId', '==', safeUid)
+      );
+      const pgSnap = await getDocs(pgQuery);
+      for (const pgDoc of pgSnap.docs) {
+        try {
+          await deleteDoc(pgDoc.ref);
+        } catch {}
+      }
+    } catch {}
 
-  const nbPath = `users/${safeUid}/notebooks/${safeNbId}`;
-  try {
-    await deleteDoc(doc(db, nbPath));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, nbPath);
+    // 2. Also delete any locally known page IDs
+    for (const page of notebook.pages) {
+      const safePageId = sanitizeId(page.id, 'pg');
+      const pagePath = `users/${safeUid}/notebooks/${candNbId}/pages/${safePageId}`;
+      try {
+        await deleteDoc(doc(db, pagePath));
+      } catch {}
+    }
+
+    // 3. Delete the notebook document itself
+    const nbPath = `users/${safeUid}/notebooks/${candNbId}`;
+    try {
+      await deleteDoc(doc(db, nbPath));
+    } catch (error) {
+      if (candNbId === sanitizeId(normalizedId, 'nb')) {
+        handleFirestoreError(error, OperationType.DELETE, nbPath);
+      }
+    }
   }
 }

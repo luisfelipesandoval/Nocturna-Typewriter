@@ -106,7 +106,7 @@ service cloud.firestore {
         isValidId(userId) &&
         isValidId(notebookId) &&
         request.auth.uid == userId &&
-        existing().ownerId == request.auth.uid;
+        (resource == null || existing().ownerId == request.auth.uid);
 
       match /pages/{pageId} {
         allow get: if isVerified() &&
@@ -151,7 +151,7 @@ service cloud.firestore {
           isValidId(notebookId) &&
           isValidId(pageId) &&
           request.auth.uid == userId &&
-          existing().ownerId == request.auth.uid;
+          (resource == null || existing().ownerId == request.auth.uid);
       }
     }
   }

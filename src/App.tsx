@@ -70,7 +70,6 @@ import {
   ParsedAuthError,
   signOutUser,
   loadUserNotebooksFromCloud,
-  subscribeToUserNotebooks,
   saveNotebookToCloud,
   deleteNotebookFromCloud,
   deletePageFromCloud,
@@ -131,6 +130,15 @@ export default function App() {
 
   const cloudSaveTimerRef = useRef<number | null>(null);
   const initialCloudLoadDoneRef = useRef<string | null>(null);
+  const currentUserRef = useRef<User | null>(null);
+  const pendingCloudSavesRef = useRef<Map<string, Notebook>>(new Map());
+  const deletedNotebookIdsRef = useRef<Set<string>>(new Set());
+  const lastUserEditAtRef = useRef<number>(0);
+  const isCloudBusyRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
 
   const activeNotebook = useMemo(() => {
     return (
@@ -142,6 +150,78 @@ export default function App() {
     const maxIdx = Math.max(0, (activeNotebook?.pages.length || 1) - 1);
     return Math.min(Math.max(0, prefs.activePageIndex), maxIdx);
   }, [activeNotebook, prefs.activePageIndex]);
+
+  const isNotebookDeleted = useCallback((id: string) => {
+    const norm = id.replace(/^draft-/, 'note-');
+    const draft = id.replace(/^note-/, 'draft-');
+    return (
+      deletedNotebookIdsRef.current.has(id) ||
+      deletedNotebookIdsRef.current.has(norm) ||
+      deletedNotebookIdsRef.current.has(draft)
+    );
+  }, []);
+
+  const flushPendingCloudSaves = useCallback(async () => {
+    const user = currentUserRef.current;
+    if (!user || pendingCloudSavesRef.current.size === 0) return;
+
+    const entries = Array.from(pendingCloudSavesRef.current.entries());
+    pendingCloudSavesRef.current.clear();
+
+    isCloudBusyRef.current = true;
+    try {
+      for (const [nbId, nb] of entries) {
+        if (isNotebookDeleted(nbId) || isNotebookDeleted(nb.id)) {
+          continue;
+        }
+        const hasContent = nb.pages.some((p) => p.content.trim().length > 0);
+        if (nb.id.startsWith('draft-') && !hasContent) {
+          continue;
+        }
+        await saveNotebookToCloud(user.uid, nb);
+      }
+      setCloudSyncState('synced');
+    } catch (err) {
+      console.error('Error saving notebook to Firestore:', err);
+      setCloudSyncState('error');
+    } finally {
+      isCloudBusyRef.current = false;
+    }
+  }, [isNotebookDeleted]);
+
+  const queueCloudSave = useCallback(
+    (notebookToSave: Notebook) => {
+      if (!currentUserRef.current) return;
+      if (isNotebookDeleted(notebookToSave.id)) return;
+      const hasContent = notebookToSave.pages.some(
+        (p) => p.content.trim().length > 0
+      );
+      if (notebookToSave.id.startsWith('draft-') && !hasContent) {
+        return;
+      }
+
+      const permanentId = notebookToSave.id.startsWith('draft-')
+        ? notebookToSave.id.replace(/^draft-/, 'note-')
+        : notebookToSave.id;
+
+      pendingCloudSavesRef.current.set(permanentId, {
+        ...notebookToSave,
+        id: permanentId,
+      });
+
+      if (cloudSaveTimerRef.current) {
+        window.clearTimeout(cloudSaveTimerRef.current);
+      }
+
+      // Wait 1.4 seconds after the user stops typing before syncing to cloud
+      // so typing is never interrupted or slowed down
+      cloudSaveTimerRef.current = window.setTimeout(() => {
+        cloudSaveTimerRef.current = null;
+        flushPendingCloudSaves();
+      }, 1400);
+    },
+    [flushPendingCloudSaves, isNotebookDeleted]
+  );
 
   // Check if returning from mobile Google Redirect login (e.g. on Vercel mobile)
   useEffect(() => {
@@ -162,31 +242,29 @@ export default function App() {
       });
   }, []);
 
-  // Listen for Firebase Auth state changes and synchronize notebooks in real-time across PC & Tablet
+  // Listen for Firebase Auth state changes and load account notebooks
   useEffect(() => {
-    let unsubscribeSnapshot: (() => void) | null = null;
-
     const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
       setCurrentUser(user);
+      currentUserRef.current = user;
       setIsAuthReady(true);
-
-      if (unsubscribeSnapshot) {
-        unsubscribeSnapshot();
-        unsubscribeSnapshot = null;
-      }
 
       if (user && initialCloudLoadDoneRef.current !== user.uid) {
         initialCloudLoadDoneRef.current = user.uid;
         setCloudSyncState('syncing');
+        isCloudBusyRef.current = true;
         try {
-          const cloudNotebooks = await loadUserNotebooksFromCloud(user.uid);
-          const localNotebooks = loadNotebooks();
+          const rawCloudNotebooks = await loadUserNotebooksFromCloud(user.uid);
+          const cloudNotebooks = rawCloudNotebooks.filter(
+            (n) => !isNotebookDeleted(n.id)
+          );
+          const localNotebooks = loadNotebooks().filter(
+            (n) => !isNotebookDeleted(n.id)
+          );
 
           // Upload any local notebooks that actually have written text and do not exist in the cloud yet
           const writtenLocal = localNotebooks
-            .filter((n) =>
-              n.pages.some((p) => p.content.trim().length > 0)
-            )
+            .filter((n) => n.pages.some((p) => p.content.trim().length > 0))
             .map((n) => ({
               ...n,
               id: n.id.startsWith('draft-')
@@ -196,24 +274,17 @@ export default function App() {
 
           const cloudMap = new Map(cloudNotebooks.map((n) => [n.id, n]));
           for (const localNb of writtenLocal) {
-            const existingCloud = cloudMap.get(localNb.id);
-            if (!existingCloud) {
+            if (!cloudMap.has(localNb.id)) {
               await saveNotebookToCloud(user.uid, localNb);
               cloudMap.set(localNb.id, localNb);
             }
           }
 
-          // Re-fetch authoritative list from cloud so PC and Tablet see the exact same pages
-          const authoritativeCloud = await loadUserNotebooksFromCloud(user.uid);
-          const finalList =
-            authoritativeCloud.length > 0
-              ? authoritativeCloud
-              : Array.from(cloudMap.values()).sort(
-                  (a, b) => b.updatedAt - a.updatedAt
-                );
+          const finalList = Array.from(cloudMap.values())
+            .filter((n) => !isNotebookDeleted(n.id))
+            .sort((a, b) => b.updatedAt - a.updatedAt);
 
           if (finalList.length > 0) {
-            // Switch directly to the account's most recent cloud page so logging in on Tablet shows the account's pages
             setNotebooks(finalList);
             setPrefs((prev) => ({
               ...prev,
@@ -230,37 +301,20 @@ export default function App() {
             }));
           }
           setCloudSyncState('synced');
-
-          // Real-time listener: when PC or Tablet saves a page, update the other device automatically
-          unsubscribeSnapshot = subscribeToUserNotebooks(
-            user.uid,
-            (liveCloudNotebooks) => {
-              if (liveCloudNotebooks.length === 0) return;
-              setNotebooks((prevLocal) => {
-                const liveMap = new Map(
-                  liveCloudNotebooks.map((n) => [n.id, n])
-                );
-                // Keep any brand-new local draft currently being typed
-                for (const loc of prevLocal) {
-                  const existing = liveMap.get(loc.id);
-                  if (!existing || loc.updatedAt > existing.updatedAt + 1500) {
-                    liveMap.set(loc.id, loc);
-                  }
-                }
-                return Array.from(liveMap.values()).sort(
-                  (a, b) => b.updatedAt - a.updatedAt
-                );
-              });
-            }
-          );
         } catch (err) {
           console.error('Error syncing notebooks with Google Cloud:', err);
           setCloudSyncState('error');
+        } finally {
+          isCloudBusyRef.current = false;
         }
       } else if (!user) {
-        // If transitioning from a logged-in user to signed-out, clear all account pages from screen & local storage
         const wasSignedIn = initialCloudLoadDoneRef.current !== null;
         initialCloudLoadDoneRef.current = null;
+        pendingCloudSavesRef.current.clear();
+        if (cloudSaveTimerRef.current) {
+          window.clearTimeout(cloudSaveTimerRef.current);
+          cloudSaveTimerRef.current = null;
+        }
         setCloudSyncState('idle');
         if (wasSignedIn) {
           const blankDraft = clearLocalNotebooks();
@@ -275,44 +329,67 @@ export default function App() {
     });
 
     return () => {
-      if (unsubscribeSnapshot) unsubscribeSnapshot();
       unsubscribeAuth();
     };
-  }, []);
+  }, [isNotebookDeleted]);
 
-  // Persist notebooks locally and schedule debounced cloud save when authenticated
+  // Quietly refresh from cloud when switching back to this tab/device (e.g. PC <-> Tablet),
+  // ONLY when the user is not actively typing or saving
+  useEffect(() => {
+    const handleVisibilityOrFocus = async () => {
+      if (document.visibilityState === 'hidden') return;
+      const user = currentUserRef.current;
+      if (!user) return;
+      if (
+        isCloudBusyRef.current ||
+        pendingCloudSavesRef.current.size > 0 ||
+        Date.now() - lastUserEditAtRef.current < 5000
+      ) {
+        return;
+      }
+
+      try {
+        const cloudList = (await loadUserNotebooksFromCloud(user.uid)).filter(
+          (n) => !isNotebookDeleted(n.id)
+        );
+        // Re-check that the user did not start typing while the network request was in flight
+        if (
+          isCloudBusyRef.current ||
+          pendingCloudSavesRef.current.size > 0 ||
+          Date.now() - lastUserEditAtRef.current < 5000
+        ) {
+          return;
+        }
+        if (cloudList.length > 0) {
+          setNotebooks(cloudList);
+          setPrefs((prev) => {
+            const stillExists = cloudList.some(
+              (n) => n.id === prev.activeNotebookId
+            );
+            return stillExists
+              ? prev
+              : {
+                  ...prev,
+                  activeNotebookId: cloudList[0].id,
+                  activePageIndex: 0,
+                };
+          });
+        }
+      } catch {}
+    };
+
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    return () => {
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+    };
+  }, [isNotebookDeleted]);
+
+  // Persist notebooks locally on every change (instant, synchronous, never triggers network loop)
   useEffect(() => {
     saveNotebooks(notebooks);
-
-    if (!isAuthReady || !currentUser || !activeNotebook) return;
-    const hasContent = activeNotebook.pages.some(
-      (p) => p.content.trim().length > 0
-    );
-    if (activeNotebook.id.startsWith('draft-') && !hasContent) {
-      return;
-    }
-
-    if (cloudSaveTimerRef.current) {
-      window.clearTimeout(cloudSaveTimerRef.current);
-    }
-
-    setCloudSyncState('syncing');
-    cloudSaveTimerRef.current = window.setTimeout(async () => {
-      try {
-        await saveNotebookToCloud(currentUser.uid, activeNotebook);
-        setCloudSyncState('synced');
-      } catch (err) {
-        console.error('Error saving active notebook to Firestore:', err);
-        setCloudSyncState('error');
-      }
-    }, 350);
-
-    return () => {
-      if (cloudSaveTimerRef.current) {
-        window.clearTimeout(cloudSaveTimerRef.current);
-      }
-    };
-  }, [notebooks, activeNotebook, currentUser, isAuthReady]);
+  }, [notebooks]);
 
   useEffect(() => {
     savePreferences(prefs);
@@ -406,21 +483,11 @@ export default function App() {
 
   const handleSignOut = async () => {
     try {
-      // cancel any pending debounced save timer and flush current written work to cloud before signing out
       if (cloudSaveTimerRef.current) {
         window.clearTimeout(cloudSaveTimerRef.current);
         cloudSaveTimerRef.current = null;
       }
-      if (currentUser && activeNotebook) {
-        const hasContent = activeNotebook.pages.some(
-          (p) => p.content.trim().length > 0
-        );
-        if (!activeNotebook.id.startsWith('draft-') || hasContent) {
-          try {
-            await saveNotebookToCloud(currentUser.uid, activeNotebook);
-          } catch {}
-        }
-      }
+      await flushPendingCloudSaves();
 
       // Wipe all account writings and pages from local memory & screen so everything returns to zero
       const blankDraft = clearLocalNotebooks();
@@ -431,6 +498,7 @@ export default function App() {
         activePageIndex: 0,
       }));
       initialCloudLoadDoneRef.current = null;
+      pendingCloudSavesRef.current.clear();
       setCloudSyncState('idle');
 
       await signOutUser();
@@ -464,6 +532,7 @@ export default function App() {
 
   const handleUpdatePageContent = (newContent: string) => {
     if (!activeNotebook) return;
+    lastUserEditAtRef.current = Date.now();
 
     const hasWrittenText =
       newContent.trim().length > 0 ||
@@ -487,80 +556,83 @@ export default function App() {
         const nextIndex = activePageIndex + 1;
         soundEngine.playKeySound('pageturn');
 
+        const updatedPages = [...activeNotebook.pages];
+        updatedPages[activePageIndex] = {
+          ...updatedPages[activePageIndex],
+          content: overflow.currentPageContent,
+          updatedAt: now,
+        };
+
+        if (
+          nextIndex < updatedPages.length &&
+          updatedPages[nextIndex].content.trim().length === 0
+        ) {
+          updatedPages[nextIndex] = {
+            ...updatedPages[nextIndex],
+            content: overflow.carryOverContent,
+            updatedAt: now,
+          };
+        } else {
+          updatedPages.splice(nextIndex, 0, {
+            id: `pg-${now}-${Math.random().toString(36).slice(2, 6)}`,
+            content: overflow.carryOverContent,
+            updatedAt: now,
+          });
+        }
+
+        const autoTitle =
+          activePageIndex === 0 &&
+          (activeNotebook.title === 'Sin título' ||
+            activeNotebook.title === 'Hoja en Blanco')
+            ? deriveTitleFromText(
+                overflow.currentPageContent,
+                activeNotebook.title
+              )
+            : activeNotebook.title;
+
+        const updatedNb: Notebook = {
+          ...activeNotebook,
+          id: promotedId,
+          title: autoTitle,
+          updatedAt: now,
+          pages: updatedPages,
+        };
+
         setNotebooks((prev) =>
-          prev.map((nb) => {
-            if (nb.id !== activeNotebook.id) return nb;
-            const updatedPages = [...nb.pages];
-            updatedPages[activePageIndex] = {
-              ...updatedPages[activePageIndex],
-              content: overflow.currentPageContent,
-              updatedAt: now,
-            };
-
-            if (
-              nextIndex < updatedPages.length &&
-              updatedPages[nextIndex].content.trim().length === 0
-            ) {
-              updatedPages[nextIndex] = {
-                ...updatedPages[nextIndex],
-                content: overflow.carryOverContent,
-                updatedAt: now,
-              };
-            } else {
-              updatedPages.splice(nextIndex, 0, {
-                id: `pg-${now}-${Math.random().toString(36).slice(2, 6)}`,
-                content: overflow.carryOverContent,
-                updatedAt: now,
-              });
-            }
-
-            const autoTitle =
-              activePageIndex === 0 &&
-              (nb.title === 'Sin título' || nb.title === 'Hoja en Blanco')
-                ? deriveTitleFromText(overflow.currentPageContent, nb.title)
-                : nb.title;
-
-            return {
-              ...nb,
-              id: promotedId,
-              title: autoTitle,
-              updatedAt: now,
-              pages: updatedPages,
-            };
-          })
+          prev.map((nb) => (nb.id === activeNotebook.id ? updatedNb : nb))
         );
-
         setPrefs((prev) => ({
           ...prev,
           activeNotebookId: promotedId,
           activePageIndex: nextIndex,
         }));
+        queueCloudSave(updatedNb);
         triggerAutoTurnNotification(nextIndex + 1);
         return;
       }
     }
 
     const now = Date.now();
+    const updatedPages = activeNotebook.pages.map((pg, idx) =>
+      idx === activePageIndex
+        ? { ...pg, content: newContent, updatedAt: now }
+        : pg
+    );
+    const autoTitle =
+      activePageIndex === 0
+        ? deriveTitleFromText(newContent, 'Sin título')
+        : activeNotebook.title;
+
+    const updatedNb: Notebook = {
+      ...activeNotebook,
+      id: promotedId,
+      title: autoTitle,
+      updatedAt: now,
+      pages: updatedPages,
+    };
+
     setNotebooks((prev) =>
-      prev.map((nb) => {
-        if (nb.id !== activeNotebook.id) return nb;
-        const updatedPages = nb.pages.map((pg, idx) =>
-          idx === activePageIndex
-            ? { ...pg, content: newContent, updatedAt: now }
-            : pg
-        );
-        const autoTitle =
-          activePageIndex === 0
-            ? deriveTitleFromText(newContent, 'Sin título')
-            : nb.title;
-        return {
-          ...nb,
-          id: promotedId,
-          title: autoTitle,
-          updatedAt: now,
-          pages: updatedPages,
-        };
-      })
+      prev.map((nb) => (nb.id === activeNotebook.id ? updatedNb : nb))
     );
 
     if (promotedId !== activeNotebook.id) {
@@ -569,6 +641,8 @@ export default function App() {
         activeNotebookId: promotedId,
       }));
     }
+
+    queueCloudSave(updatedNb);
   };
 
   const handleSelectPage = (index: number) => {
@@ -584,6 +658,7 @@ export default function App() {
   };
 
   const handleCreateLoosePage = () => {
+    lastUserEditAtRef.current = Date.now();
     const now = Date.now();
     const newNb: Notebook = {
       id: `note-${now}`,
@@ -605,10 +680,12 @@ export default function App() {
       activeNotebookId: newNb.id,
       activePageIndex: 0,
     }));
+    queueCloudSave(newNb);
     setActivePopover(null);
   };
 
   const handleCreateNewBook = () => {
+    lastUserEditAtRef.current = Date.now();
     const now = Date.now();
     const bookCount =
       notebooks.filter((n) => n.id.startsWith('book-')).length + 1;
@@ -637,73 +714,104 @@ export default function App() {
       activeNotebookId: newBook.id,
       activePageIndex: 0,
     }));
+    queueCloudSave(newBook);
     setActivePopover(null);
   };
 
   const handleAddChapterPageToCurrent = () => {
     if (!activeNotebook) return;
+    lastUserEditAtRef.current = Date.now();
     const now = Date.now();
     const newPageIndex = activeNotebook.pages.length;
     soundEngine.playKeySound('pageturn');
 
+    const updatedNb: Notebook = {
+      ...activeNotebook,
+      updatedAt: now,
+      pages: [
+        ...activeNotebook.pages,
+        {
+          id: `pg-${now}-${Math.random().toString(36).slice(2, 6)}`,
+          content: '',
+          updatedAt: now,
+        },
+      ],
+    };
+
     setNotebooks((prev) =>
-      prev.map((nb) =>
-        nb.id === activeNotebook.id
-          ? {
-              ...nb,
-              updatedAt: now,
-              pages: [
-                ...nb.pages,
-                {
-                  id: `pg-${now}-${Math.random().toString(36).slice(2, 6)}`,
-                  content: '',
-                  updatedAt: now,
-                },
-              ],
-            }
-          : nb
-      )
+      prev.map((nb) => (nb.id === activeNotebook.id ? updatedNb : nb))
     );
     setPrefs((prev) => ({ ...prev, activePageIndex: newPageIndex }));
+    queueCloudSave(updatedNb);
   };
 
   const handleDeleteNotebook = async (notebookId: string) => {
+    lastUserEditAtRef.current = Date.now();
     const targetNb = notebooks.find((nb) => nb.id === notebookId);
-    const remaining = notebooks.filter((nb) => nb.id !== notebookId);
+
+    // Record all ID variants as deleted so no pending save or cloud refresh can resurrect it
+    const normId = notebookId.replace(/^draft-/, 'note-');
+    const draftId = notebookId.replace(/^note-/, 'draft-');
+    deletedNotebookIdsRef.current.add(notebookId);
+    deletedNotebookIdsRef.current.add(normId);
+    deletedNotebookIdsRef.current.add(draftId);
+
+    pendingCloudSavesRef.current.delete(notebookId);
+    pendingCloudSavesRef.current.delete(normId);
+    pendingCloudSavesRef.current.delete(draftId);
+
+    const remaining = notebooks.filter(
+      (nb) => nb.id !== notebookId && nb.id !== normId && nb.id !== draftId
+    );
     const nextList =
       remaining.length > 0 ? remaining : [createBlankDraftNotebook()];
     setNotebooks(nextList);
-    if (prefs.activeNotebookId === notebookId) {
+
+    if (
+      prefs.activeNotebookId === notebookId ||
+      prefs.activeNotebookId === normId ||
+      prefs.activeNotebookId === draftId
+    ) {
       setPrefs((prev) => ({
         ...prev,
         activeNotebookId: nextList[0].id,
         activePageIndex: 0,
       }));
     }
-    if (currentUser && targetNb && !targetNb.id.startsWith('draft-')) {
+
+    if (currentUser && targetNb) {
+      isCloudBusyRef.current = true;
       try {
         await deleteNotebookFromCloud(currentUser.uid, targetNb);
       } catch (err) {
         console.error('Error deleting notebook from Firestore:', err);
+      } finally {
+        isCloudBusyRef.current = false;
       }
     }
   };
 
   const handleDeleteCurrentPage = async () => {
-    if (!activeNotebook || activeNotebook.pages.length <= 1) return;
+    if (!activeNotebook) return;
+    lastUserEditAtRef.current = Date.now();
+
+    // If this notebook only has 1 page, delete the entire notebook/page cleanly
+    if (activeNotebook.pages.length <= 1) {
+      setActivePopover(null);
+      await handleDeleteNotebook(activeNotebook.id);
+      return;
+    }
+
     const targetPage = activeNotebook.pages[activePageIndex];
     const nextIdx = Math.max(0, activePageIndex - 1);
+    const updatedNb: Notebook = {
+      ...activeNotebook,
+      updatedAt: Date.now(),
+      pages: activeNotebook.pages.filter((_, i) => i !== activePageIndex),
+    };
 
     setNotebooks((prev) =>
-      prev.map((nb) =>
-        nb.id === activeNotebook.id
-          ? {
-              ...nb,
-              updatedAt: Date.now(),
-              pages: nb.pages.filter((_, i) => i !== activePageIndex),
-            }
-          : nb
-      )
+      prev.map((nb) => (nb.id === activeNotebook.id ? updatedNb : nb))
     );
     setPrefs((prev) => ({ ...prev, activePageIndex: nextIdx }));
 
@@ -714,6 +822,7 @@ export default function App() {
           activeNotebook.id,
           targetPage.id
         );
+        queueCloudSave(updatedNb);
       } catch (err) {
         console.error('Error deleting page from Firestore:', err);
       }
@@ -1064,9 +1173,12 @@ export default function App() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleDeleteNotebook(book.id)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteNotebook(book.id);
+                          }}
                           aria-label={`Eliminar ${book.title}`}
-                          className="p-1 text-[#9E8770] hover:text-[#B54B32] transition-colors cursor-pointer"
+                          className="p-1.5 rounded-lg text-[#9E8770] hover:text-[#B54B32] hover:bg-[#EAE0D0] transition-colors cursor-pointer"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -1140,9 +1252,12 @@ export default function App() {
 
                         <button
                           type="button"
-                          onClick={() => handleDeleteNotebook(note.id)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteNotebook(note.id);
+                          }}
                           aria-label={`Eliminar ${note.title}`}
-                          className="p-1 text-[#9E8770] hover:text-[#B54B32] transition-colors cursor-pointer"
+                          className="p-1.5 rounded-lg text-[#9E8770] hover:text-[#B54B32] hover:bg-[#EAE0D0] transition-colors cursor-pointer"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -1339,18 +1454,26 @@ export default function App() {
                   type="button"
                   onClick={async () => {
                     if (!currentUser) return;
+                    if (cloudSaveTimerRef.current) {
+                      window.clearTimeout(cloudSaveTimerRef.current);
+                      cloudSaveTimerRef.current = null;
+                    }
                     setCloudSyncState('syncing');
+                    isCloudBusyRef.current = true;
                     try {
-                      // 1. Fetch authoritative notebooks from Google Cloud first
-                      const cloudNotebooks = await loadUserNotebooksFromCloud(
+                      await flushPendingCloudSaves();
+                      const rawCloudNotebooks = await loadUserNotebooksFromCloud(
                         currentUser.uid
+                      );
+                      const cloudNotebooks = rawCloudNotebooks.filter(
+                        (n) => !isNotebookDeleted(n.id)
                       );
                       const cloudMap = new Map(
                         cloudNotebooks.map((n) => [n.id, n])
                       );
 
-                      // 2. Upload any written local notebooks that are newer or not yet in cloud
                       for (const nb of notebooks) {
+                        if (isNotebookDeleted(nb.id)) continue;
                         const hasText = nb.pages.some(
                           (p) => p.content.trim().length > 0
                         );
@@ -1371,15 +1494,22 @@ export default function App() {
                         }
                       }
 
-                      // 3. Re-fetch complete unified list from server and switch directly to the account's latest page
-                      const unifiedCloud = await loadUserNotebooksFromCloud(
-                        currentUser.uid
-                      );
+                      const unifiedCloud = (
+                        await loadUserNotebooksFromCloud(currentUser.uid)
+                      ).filter((n) => !isNotebookDeleted(n.id));
                       if (unifiedCloud.length > 0) {
                         setNotebooks(unifiedCloud);
                         setPrefs((prev) => ({
                           ...prev,
                           activeNotebookId: unifiedCloud[0].id,
+                          activePageIndex: 0,
+                        }));
+                      } else {
+                        const fresh = createBlankDraftNotebook();
+                        setNotebooks([fresh]);
+                        setPrefs((prev) => ({
+                          ...prev,
+                          activeNotebookId: fresh.id,
                           activePageIndex: 0,
                         }));
                       }
@@ -1389,6 +1519,8 @@ export default function App() {
                     } catch (err) {
                       console.error('Manual cloud sync error:', err);
                       setCloudSyncState('error');
+                    } finally {
+                      isCloudBusyRef.current = false;
                     }
                   }}
                   className="w-full flex items-center justify-center gap-2 py-2 rounded-full bg-[#FAF5EC] border border-[#D8CBB8] text-[#2F231A] font-medium hover:bg-[#EFE6D8] transition-colors cursor-pointer"
@@ -1907,14 +2039,20 @@ export default function App() {
                 )}
               </button>
 
-              {totalPages > 1 && (
+              {(totalPages > 1 ||
+                currentPageContent.trim().length > 0 ||
+                (activeNotebook && !activeNotebook.id.startsWith('draft-'))) && (
                 <button
                   type="button"
                   onClick={handleDeleteCurrentPage}
                   className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-xl text-[#A84A24] hover:bg-[#EAE0D0] transition-colors cursor-pointer"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
-                  <span>Borrar hoja actual ({activePageIndex + 1})</span>
+                  <span>
+                    {totalPages > 1
+                      ? `Borrar hoja actual (${activePageIndex + 1})`
+                      : 'Borrar página actual'}
+                  </span>
                 </button>
               )}
             </div>
