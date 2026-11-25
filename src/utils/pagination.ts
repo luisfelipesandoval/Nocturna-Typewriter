@@ -192,3 +192,73 @@ export function calculateTextMetrics(text: string, charsPerLine: number = 62): T
     readingMinutes,
   };
 }
+
+/**
+ * Moves a caret index up or down by `rowDelta` visual lines while preserving column offset.
+ */
+export function moveCaretByVisualRows(
+  text: string,
+  currentCaretIndex: number,
+  rowDelta: number,
+  charsPerLine: number = 62
+): number {
+  if (!text || rowDelta === 0) return Math.max(0, Math.min(currentCaretIndex, text.length));
+  const safeMaxCols = Math.max(20, charsPerLine);
+  const clampedCaret = Math.max(0, Math.min(currentCaretIndex, text.length));
+
+  interface VisualLineSpan {
+    start: number;
+    end: number;
+  }
+
+  const spans: VisualLineSpan[] = [];
+  const paragraphs = text.split('\n');
+  let cursor = 0;
+
+  for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
+    const paragraph = paragraphs[pIdx];
+    if (paragraph.length === 0) {
+      spans.push({ start: cursor, end: cursor });
+    } else {
+      let remaining = paragraph;
+      let localOffset = 0;
+      while (remaining.length > safeMaxCols) {
+        let breakIndex = remaining.lastIndexOf(' ', safeMaxCols);
+        let chunkLen: number;
+        if (breakIndex <= 0) {
+          chunkLen = safeMaxCols;
+        } else {
+          chunkLen = breakIndex + 1;
+        }
+        spans.push({
+          start: cursor + localOffset,
+          end: cursor + localOffset + chunkLen,
+        });
+        localOffset += chunkLen;
+        remaining = remaining.slice(chunkLen);
+      }
+      spans.push({
+        start: cursor + localOffset,
+        end: cursor + paragraph.length,
+      });
+    }
+    cursor += paragraph.length + 1; // +1 for '\n'
+  }
+
+  if (spans.length === 0) return 0;
+
+  let activeRow = spans.length - 1;
+  for (let i = 0; i < spans.length; i++) {
+    if (clampedCaret >= spans[i].start && clampedCaret <= spans[i].end) {
+      activeRow = i;
+      break;
+    }
+  }
+
+  const colOffset = Math.max(0, clampedCaret - spans[activeRow].start);
+  const targetRow = Math.max(0, Math.min(spans.length - 1, activeRow + rowDelta));
+  const targetSpan = spans[targetRow];
+  const maxColOnTarget = Math.max(0, targetSpan.end - targetSpan.start);
+  return targetSpan.start + Math.min(colOffset, maxColOnTarget);
+}
+

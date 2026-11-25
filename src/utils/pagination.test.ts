@@ -5,6 +5,7 @@ import {
   getCursorVisualPosition,
   evaluatePageOverflow,
   calculateTextMetrics,
+  moveCaretByVisualRows,
 } from './pagination';
 
 test('computeVisualLines wraps words cleanly and respects newlines', () => {
@@ -44,3 +45,14 @@ test('calculateTextMetrics counts words, characters, and visual lines accurately
   assert.equal(metrics.characters, 52);
   assert.equal(metrics.visualLines, 1);
 });
+
+test('moveCaretByVisualRows moves cursor up and down across newlines while preserving column', () => {
+  const text = 'kfaskhfkafafa\n\n\n\n';
+  // From the last empty line (index 17) moving up 4 rows lands on line 0
+  const movedUp = moveCaretByVisualRows(text, 17, -4, 58);
+  assert.equal(movedUp, 0);
+  // From end of first line (index 13) moving down 1 row lands on empty line 1 (index 14)
+  const movedDown = moveCaretByVisualRows(text, 13, 1, 58);
+  assert.equal(movedDown, 14);
+});
+

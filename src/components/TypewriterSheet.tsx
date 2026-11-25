@@ -8,6 +8,7 @@ import React, {
 import {
   CursorVisualPosition,
   getCursorVisualPosition,
+  moveCaretByVisualRows,
   Notebook,
   PageItem,
 } from '../utils/pagination';
@@ -37,6 +38,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
   onPlayKeySound,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const mirrorCaretRef = useRef<HTMLSpanElement | null>(null);
 
@@ -58,7 +60,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
   // Exact pixel coordinates of the caret inside the paper block
   const [caretPixel, setCaretPixel] = useState<{ x: number; y: number }>({
     x: 24,
-    y: 0,
+    y: 3,
   });
 
   const [isActivelyTyping, setIsActivelyTyping] = useState(false);
@@ -71,8 +73,25 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
   const hammerTimeoutRef = useRef<number | null>(null);
   const prevPageIndexRef = useRef<number>(activePageIndex);
   const hasExplicitCaretRef = useRef<boolean>(false);
+  const wheelAccumRef = useRef<number>(0);
+
+  const lockZeroScroll = useCallback(() => {
+    if (textareaRef.current) {
+      textareaRef.current.scrollTop = 0;
+      textareaRef.current.scrollLeft = 0;
+    }
+    if (stageRef.current) {
+      stageRef.current.scrollTop = 0;
+      stageRef.current.scrollLeft = 0;
+    }
+    if (containerRef.current) {
+      containerRef.current.scrollTop = 0;
+      containerRef.current.scrollLeft = 0;
+    }
+  }, []);
 
   const measureCaretPixels = useCallback(() => {
+    lockZeroScroll();
     const marker = mirrorCaretRef.current;
     if (marker) {
       setCaretPixel({
@@ -80,10 +99,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
         y: marker.offsetTop,
       });
     }
-    if (textareaRef.current) {
-      textareaRef.current.scrollTop = 0;
-    }
-  }, []);
+  }, [lockZeroScroll]);
 
   useLayoutEffect(() => {
     measureCaretPixels();
@@ -100,6 +116,32 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
     return () => window.removeEventListener('resize', handleResize);
   }, [measureCaretPixels]);
 
+  const syncCaretPosition = useCallback(() => {
+    lockZeroScroll();
+    const el = textareaRef.current;
+    if (!el) return;
+    hasExplicitCaretRef.current = true;
+    const sel = el.selectionStart ?? el.value.length;
+    setCaretIndex(sel);
+    setCursorPos(getCursorVisualPosition(el.value, sel, charsPerLine));
+  }, [charsPerLine, lockZeroScroll]);
+
+  // Listen to document selectionchange so mobile/tablet touch caret movements
+  // and mouse clicks on upper lines always sync caretIndex immediately
+  useEffect(() => {
+    const handleSelectionChange = () => {
+      if (
+        typeof document !== 'undefined' &&
+        document.activeElement === textareaRef.current
+      ) {
+        syncCaretPosition();
+      }
+    };
+    document.addEventListener('selectionchange', handleSelectionChange);
+    return () =>
+      document.removeEventListener('selectionchange', handleSelectionChange);
+  }, [syncCaretPosition]);
+
   // Detect page changes for smooth visual transition
   useEffect(() => {
     if (prevPageIndexRef.current !== activePageIndex) {
@@ -115,12 +157,12 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
       if (textareaRef.current) {
         textareaRef.current.focus();
         textareaRef.current.setSelectionRange(len, len);
-        textareaRef.current.scrollTop = 0;
       }
+      lockZeroScroll();
       setCursorPos(getCursorVisualPosition(pageText, len, charsPerLine));
       return () => window.clearTimeout(timer);
     }
-  }, [activePageIndex, notebook.pages, charsPerLine]);
+  }, [activePageIndex, notebook.pages, charsPerLine, lockZeroScroll]);
 
   // Keep cursor position synced when content changes
   useEffect(() => {
@@ -132,9 +174,10 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
       el && (isFocused || hasExplicitCaretRef.current)
         ? Math.min(el.selectionStart ?? content.length, content.length)
         : content.length;
+    lockZeroScroll();
     setCaretIndex(sel);
     setCursorPos(getCursorVisualPosition(content, sel, charsPerLine));
-  }, [currentPage?.content, charsPerLine]);
+  }, [currentPage?.content, charsPerLine, lockZeroScroll]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (
@@ -171,21 +214,16 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
     typingTimeoutRef.current = window.setTimeout(() => {
       setIsActivelyTyping(false);
     }, 1100);
-  };
 
-  const syncCaretPosition = () => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.scrollTop = 0;
-    hasExplicitCaretRef.current = true;
-    const sel = el.selectionStart ?? el.value.length;
-    setCaretIndex(sel);
-    setCursorPos(getCursorVisualPosition(el.value, sel, charsPerLine));
+    // Sync immediately on the next frame for held navigation keys (ArrowUp/ArrowDown/Home/End)
+    window.requestAnimationFrame(() => {
+      syncCaretPosition();
+    });
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     hasExplicitCaretRef.current = true;
-    e.target.scrollTop = 0;
+    lockZeroScroll();
     const nextValue = e.target.value;
     const caret = e.target.selectionStart ?? nextValue.length;
     setCaretIndex(caret);
@@ -193,11 +231,43 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
     onUpdatePageContent(nextValue, caret);
   };
 
+  // Allow mouse wheel / trackpad vertical scroll to smoothly move up and down
+  // through written lines while keeping the active line pinned at the center rail
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    lockZeroScroll();
+    if (!fullContent) return;
+    wheelAccumRef.current += e.deltaY;
+    const STEP_THRESHOLD = 28;
+    if (Math.abs(wheelAccumRef.current) < STEP_THRESHOLD) return;
+
+    const rowSteps =
+      wheelAccumRef.current > 0
+        ? Math.floor(wheelAccumRef.current / STEP_THRESHOLD)
+        : Math.ceil(wheelAccumRef.current / STEP_THRESHOLD);
+    wheelAccumRef.current -= rowSteps * STEP_THRESHOLD;
+
+    const nextCaret = moveCaretByVisualRows(
+      fullContent,
+      caretIndex,
+      rowSteps,
+      charsPerLine
+    );
+    if (nextCaret !== caretIndex) {
+      hasExplicitCaretRef.current = true;
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.setSelectionRange(nextCaret, nextCaret);
+      }
+      setCaretIndex(nextCaret);
+      setCursorPos(getCursorVisualPosition(fullContent, nextCaret, charsPerLine));
+    }
+  };
+
   // The horizontal rail NEVER moves down. It stays fixed at fixedRailTopPx.
   // The active line (caretPixel.y) is always pinned right above the "T" hammer on the rail,
   // and as more lines are written, the text translates UPWARD into the darkness.
-  const stageHeightPx = fixedRailTopPx - 10;
-  const activeLineTargetY = stageHeightPx - LINE_HEIGHT_PX - 4;
+  const stageHeightPx = fixedRailTopPx - 14;
+  const activeLineTargetY = stageHeightPx - 28;
   const textTranslateY = activeLineTargetY - caretPixel.y;
 
   const spotlightCenterX = caretPixel.x;
@@ -209,9 +279,10 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
   const textAfterCaret = fullContent.slice(caretIndex);
 
   // Single non-nested vertical fade mask on Text Layer A (in paper coordinates)
-  // so older lines fade progressively into the dark background as they rise above the rail:
+  // so older lines fade progressively into the dark background as they rise above the rail,
+  // and any lines below the active line are cleanly hidden above the rail:
   const activeTop = caretPixel.y;
-  const activeBot = caretPixel.y + LINE_HEIGHT_PX + 4;
+  const activeBot = caretPixel.y + 26;
   const row1Up = Math.max(0, activeTop - LINE_HEIGHT_PX * 1);
   const row2Up = Math.max(0, activeTop - LINE_HEIGHT_PX * 2);
   const row3Up = Math.max(0, activeTop - LINE_HEIGHT_PX * 3);
@@ -219,38 +290,50 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
   const row5Up = Math.max(0, activeTop - LINE_HEIGHT_PX * 5.2);
 
   const baseTextVerticalFadeMask =
-    activeTop <= 4
+    activeTop <= 6
       ? `linear-gradient(180deg, rgba(0,0,0,1) 0px, rgba(0,0,0,1) ${activeBot}px, rgba(0,0,0,0) ${
-          activeBot + 4
+          activeBot + 2
         }px)`
       : `linear-gradient(180deg, rgba(0,0,0,0) 0px, rgba(0,0,0,0) ${row5Up}px, rgba(0,0,0,0.12) ${row4Up}px, rgba(0,0,0,0.26) ${row3Up}px, rgba(0,0,0,0.44) ${row2Up}px, rgba(0,0,0,0.68) ${row1Up}px, rgba(0,0,0,0.92) ${activeTop}px, rgba(0,0,0,0.92) ${activeBot}px, rgba(0,0,0,0) ${
-          activeBot + 4
+          activeBot + 2
         }px)`;
 
   // Single non-nested radial spotlight mask on Text Layer B (in paper coordinates)
-  // centered at the caret so characters touched by the light beam shine in crisp cream (#FFF6E6)
+  // centered at the caret so characters touched by the light beam shine in crisp cream (#F7EBD9)
   // on the active line and fade naturally upward along the beam cone without washing out:
   const spotlightRadiusX =
     lampIntensity === 'suave' ? 115 : lampIntensity === 'intensa' ? 185 : 145;
   const spotlightRadiusY =
     lampIntensity === 'suave' ? 135 : lampIntensity === 'intensa' ? 205 : 170;
   const spotlightMaskGradient = `radial-gradient(ellipse ${spotlightRadiusX}px ${spotlightRadiusY}px at ${spotlightCenterX}px ${
-    caretPixel.y + LINE_HEIGHT_PX * 0.55
+    caretPixel.y + LINE_HEIGHT_PX * 0.45
   }px, rgba(0,0,0,1) 0%, rgba(0,0,0,0.92) 28%, rgba(0,0,0,0.52) 56%, rgba(0,0,0,0.18) 80%, rgba(0,0,0,0) 100%)`;
 
   const dynamicPaperHeightPx = Math.max(
-    800,
-    caretPixel.y + LINE_HEIGHT_PX * 10 + 400
+    LINE_HEIGHT_PX * 3,
+    (cursorPos.totalVisualLines + 2) * LINE_HEIGHT_PX,
+    caretPixel.y + LINE_HEIGHT_PX * 3
   );
 
   return (
     <div
       ref={containerRef}
-      onClick={() => textareaRef.current?.focus()}
-      className={`relative w-full flex-1 overflow-hidden flex flex-col items-center justify-start transition-opacity duration-200 cursor-text ${
+      onScroll={lockZeroScroll}
+      onWheel={handleWheel}
+      onClick={(e) => {
+        if (e.target !== textareaRef.current) {
+          textareaRef.current?.focus();
+          lockZeroScroll();
+        }
+      }}
+      className={`relative w-full flex-1 flex flex-col items-center justify-start transition-opacity duration-200 cursor-text ${
         pageTurnDirection ? 'opacity-85' : 'opacity-100'
       }`}
-      style={{ height: '100vh', minHeight: `${fixedRailTopPx + 180}px` }}
+      style={{
+        height: '100vh',
+        minHeight: `${fixedRailTopPx + 180}px`,
+        overflow: 'clip',
+      }}
     >
       {/* FIXED HORIZONTAL BRONZE RAIL IN THE CENTER OF THE VIEWPORT */}
       <div
@@ -408,11 +491,14 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
           </div>
         </div>
 
-        {/* 2. PAPER STAGE ABOVE THE FIXED CENTER RAIL — Clips anything below the horizontal rail */}
+        {/* 2. PAPER STAGE ABOVE THE FIXED CENTER RAIL — Clips anything below the horizontal rail without creating a scroll container */}
         <div
-          className="absolute top-0 left-0 right-0 overflow-hidden z-20"
+          ref={stageRef}
+          onScroll={lockZeroScroll}
+          className="absolute top-0 left-0 right-0 z-20"
           style={{
             height: `${stageHeightPx}px`,
+            overflow: 'clip',
           }}
         >
           {/* UPWARD-SHIFTING PAPER LAYER: Moves up as new lines are typed so active line stays at the fixed rail */}
@@ -453,7 +539,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
               aria-hidden="true"
               style={{
                 paddingTop: '0px',
-                paddingBottom: '80px',
+                paddingBottom: '12px',
                 paddingLeft: '24px',
                 paddingRight: '24px',
                 lineHeight: `${LINE_HEIGHT_PX}px`,
@@ -474,7 +560,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
               aria-hidden="true"
               style={{
                 paddingTop: '0px',
-                paddingBottom: '80px',
+                paddingBottom: '12px',
                 paddingLeft: '24px',
                 paddingRight: '24px',
                 lineHeight: `${LINE_HEIGHT_PX}px`,
@@ -492,7 +578,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
               data-testid="spotlight-illuminated-text"
               style={{
                 paddingTop: '0px',
-                paddingBottom: '80px',
+                paddingBottom: '12px',
                 paddingLeft: '24px',
                 paddingRight: '24px',
                 lineHeight: `${LINE_HEIGHT_PX}px`,
@@ -511,22 +597,26 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
               onChange={handleChange}
               onKeyDown={handleKeyDown}
               onClick={syncCaretPosition}
+              onMouseUp={syncCaretPosition}
+              onTouchEnd={syncCaretPosition}
               onKeyUp={syncCaretPosition}
               onSelect={syncCaretPosition}
+              onScroll={lockZeroScroll}
               aria-label={`Contenido de la hoja ${activePageIndex + 1}`}
               spellCheck={false}
               autoFocus
               style={{
                 paddingTop: '0px',
-                paddingBottom: '80px',
+                paddingBottom: '12px',
                 paddingLeft: '24px',
                 paddingRight: '24px',
                 lineHeight: `${LINE_HEIGHT_PX}px`,
                 height: `${dynamicPaperHeightPx}px`,
                 color: 'transparent',
                 caretColor: '#F3D08E',
+                overflow: 'clip',
               }}
-              className="relative z-20 w-full overflow-hidden bg-transparent resize-none border-0 focus:outline-none whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em] selection:bg-[#D99B4E]/35 selection:text-transparent"
+              className="relative z-20 w-full bg-transparent resize-none border-0 focus:outline-none whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em] selection:bg-[#D99B4E]/35 selection:text-transparent"
             />
           </div>
         </div>
