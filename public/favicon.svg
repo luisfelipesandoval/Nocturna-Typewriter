@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="62%" r="60%">
+      <stop offset="0%" stop-color="#2B2218" />
+      <stop offset="100%" stop-color="#14110E" />
+    </radialGradient>
+    <linearGradient id="beam" x1="32" y1="44" x2="32" y2="8" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F3C98B" stop-opacity="0.72" />
+      <stop offset="55%" stop-color="#D9A35F" stop-opacity="0.28" />
+      <stop offset="100%" stop-color="#D9A35F" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="carriage" x1="32" y1="43" x2="32" y2="53" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F2E4CE" />
+      <stop offset="100%" stop-color="#C5B092" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded nocturnal background -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)" stroke="#6E5740" stroke-width="2" />
+
+  <!-- Warm upward light cone -->
+  <path d="M27 42 L8 10 H56 L37 42 Z" fill="url(#beam)" />
+
+  <!-- Subtle typewriter letter 'a' illuminated in the beam -->
+  <text x="32" y="28" text-anchor="middle" fill="#F7EBD9" font-family="Courier New, monospace" font-weight="700" font-size="18">T</text>
+
+  <!-- Fixed horizontal bronze rail -->
+  <line x1="4" y1="47" x2="60" y2="47" stroke="#856A4E" stroke-width="2" />
+
+  <!-- The 'T' hammer post -->
+  <rect x="28" y="38" width="8" height="2.2" rx="1" fill="#F5E6CE" />
+  <rect x="30.9" y="39.5" width="2.2" height="5" fill="#D5C1A5" />
+
+  <!-- Ivory capsule carriage -->
+  <rect x="19" y="44" width="26" height="10" rx="5" fill="url(#carriage)" stroke="#766149" stroke-width="1.2" />
+
+  <!-- Two amber dots and one dark dot -->
+  <circle cx="25.5" cy="49" r="2" fill="#DE8C3E" />
+  <circle cx="31.5" cy="49" r="2" fill="#DE8C3E" />
+  <circle cx="37.5" cy="49" r="2" fill="#4A3F35" />
+</svg>

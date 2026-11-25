@@ -5,6 +5,7 @@ import React, {
   useRef,
   useState,
 } from 'react';
+import { Eye, EyeOff, GripVertical } from 'lucide-react';
 import {
   CursorVisualPosition,
   getCursorVisualPosition,
@@ -74,6 +75,133 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
   const prevPageIndexRef = useRef<number>(activePageIndex);
   const hasExplicitCaretRef = useRef<boolean>(false);
   const wheelAccumRef = useRef<number>(0);
+  const caretIndexRef = useRef<number>(caretIndex);
+
+  // Touch-scroll tracking for tablets and phones
+  const touchStartYRef = useRef<number | null>(null);
+  const touchStartXRef = useRef<number | null>(null);
+  const touchLastYRef = useRef<number | null>(null);
+  const touchAccumRef = useRef<number>(0);
+  const isTouchDraggingRef = useRef<boolean>(false);
+  const lastTouchScrollAtRef = useRef<number>(0);
+
+  // Movable & opacity-hideable line navigator pill state
+  const navPillRef = useRef<HTMLDivElement | null>(null);
+  const [navOffset, setNavOffset] = useState<{ x: number; y: number }>(() => {
+    try {
+      const raw = localStorage.getItem('nocturna_line_nav_offset_v1');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (
+          typeof parsed?.x === 'number' &&
+          typeof parsed?.y === 'number'
+        ) {
+          return { x: parsed.x, y: parsed.y };
+        }
+      }
+    } catch {}
+    return { x: 0, y: 0 };
+  });
+
+  const [isNavDimmed, setIsNavDimmed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('nocturna_line_nav_dimmed_v1') === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  const navDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    origX: number;
+    origY: number;
+    moved: boolean;
+  } | null>(null);
+  const wasNavDraggedRef = useRef<boolean>(false);
+
+  const handleNavPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    wasNavDraggedRef.current = false;
+    navDragRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: navOffset.x,
+      origY: navOffset.y,
+      moved: false,
+    };
+  };
+
+  const handleNavPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = navDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    e.stopPropagation();
+
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+
+    if (!drag.moved && Math.hypot(dx, dy) > 5) {
+      drag.moved = true;
+      wasNavDraggedRef.current = true;
+      try {
+        navPillRef.current?.setPointerCapture(e.pointerId);
+      } catch {}
+    }
+
+    if (drag.moved) {
+      const vw = typeof window !== 'undefined' ? window.innerWidth : 1280;
+      const vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+      const maxX = Math.max(80, vw / 2 - 70);
+      const minY = -(fixedRailTopPx + 10);
+      const maxY = Math.max(60, vh - fixedRailTopPx - 70);
+
+      const nextX = Math.round(
+        Math.max(-maxX, Math.min(maxX, drag.origX + dx))
+      );
+      const nextY = Math.round(
+        Math.max(minY, Math.min(maxY, drag.origY + dy))
+      );
+      setNavOffset({ x: nextX, y: nextY });
+    }
+  };
+
+  const handleNavPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = navDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    e.stopPropagation();
+    if (drag.moved) {
+      try {
+        navPillRef.current?.releasePointerCapture(e.pointerId);
+      } catch {}
+      try {
+        localStorage.setItem(
+          'nocturna_line_nav_offset_v1',
+          JSON.stringify(navOffset)
+        );
+      } catch {}
+      window.setTimeout(() => {
+        wasNavDraggedRef.current = false;
+      }, 60);
+    }
+    navDragRef.current = null;
+  };
+
+  const toggleNavDimmed = () => {
+    if (wasNavDraggedRef.current) return;
+    setIsNavDimmed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('nocturna_line_nav_dimmed_v1', next ? '1' : '0');
+      } catch {}
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    caretIndexRef.current = caretIndex;
+  }, [caretIndex]);
 
   const lockZeroScroll = useCallback(() => {
     if (textareaRef.current) {
@@ -120,8 +248,17 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
     lockZeroScroll();
     const el = textareaRef.current;
     if (!el) return;
+    // Do not let native post-swipe touch selection snap caretIndex back after a tablet vertical drag
+    if (
+      isTouchDraggingRef.current ||
+      Date.now() - lastTouchScrollAtRef.current < 350
+    ) {
+      el.setSelectionRange(caretIndexRef.current, caretIndexRef.current);
+      return;
+    }
     hasExplicitCaretRef.current = true;
     const sel = el.selectionStart ?? el.value.length;
+    caretIndexRef.current = sel;
     setCaretIndex(sel);
     setCursorPos(getCursorVisualPosition(el.value, sel, charsPerLine));
   }, [charsPerLine, lockZeroScroll]);
@@ -153,6 +290,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
 
       const pageText = notebook.pages[activePageIndex]?.content || '';
       const len = pageText.length;
+      caretIndexRef.current = len;
       setCaretIndex(len);
       if (textareaRef.current) {
         textareaRef.current.focus();
@@ -175,9 +313,50 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
         ? Math.min(el.selectionStart ?? content.length, content.length)
         : content.length;
     lockZeroScroll();
+    caretIndexRef.current = sel;
     setCaretIndex(sel);
     setCursorPos(getCursorVisualPosition(content, sel, charsPerLine));
   }, [currentPage?.content, charsPerLine, lockZeroScroll]);
+
+  const stepVisualRow = useCallback(
+    (rowSteps: number) => {
+      lockZeroScroll();
+      if (!fullContent || rowSteps === 0) return;
+      const nextCaret = moveCaretByVisualRows(
+        fullContent,
+        caretIndexRef.current,
+        rowSteps,
+        charsPerLine
+      );
+      if (nextCaret !== caretIndexRef.current) {
+        hasExplicitCaretRef.current = true;
+        lastTouchScrollAtRef.current = Date.now();
+        caretIndexRef.current = nextCaret;
+        if (textareaRef.current) {
+          textareaRef.current.setSelectionRange(nextCaret, nextCaret);
+        }
+        setCaretIndex(nextCaret);
+        setCursorPos(
+          getCursorVisualPosition(fullContent, nextCaret, charsPerLine)
+        );
+      }
+    },
+    [charsPerLine, fullContent, lockZeroScroll]
+  );
+
+  const jumpToLatestLine = useCallback(() => {
+    lockZeroScroll();
+    const endCaret = fullContent.length;
+    hasExplicitCaretRef.current = true;
+    lastTouchScrollAtRef.current = Date.now();
+    caretIndexRef.current = endCaret;
+    if (textareaRef.current) {
+      textareaRef.current.focus();
+      textareaRef.current.setSelectionRange(endCaret, endCaret);
+    }
+    setCaretIndex(endCaret);
+    setCursorPos(getCursorVisualPosition(fullContent, endCaret, charsPerLine));
+  }, [charsPerLine, fullContent, lockZeroScroll]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (
@@ -226,6 +405,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
     lockZeroScroll();
     const nextValue = e.target.value;
     const caret = e.target.selectionStart ?? nextValue.length;
+    caretIndexRef.current = caret;
     setCaretIndex(caret);
     setCursorPos(getCursorVisualPosition(nextValue, caret, charsPerLine));
     onUpdatePageContent(nextValue, caret);
@@ -246,21 +426,74 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
         : Math.ceil(wheelAccumRef.current / STEP_THRESHOLD);
     wheelAccumRef.current -= rowSteps * STEP_THRESHOLD;
 
-    const nextCaret = moveCaretByVisualRows(
-      fullContent,
-      caretIndex,
-      rowSteps,
-      charsPerLine
-    );
-    if (nextCaret !== caretIndex) {
-      hasExplicitCaretRef.current = true;
-      if (textareaRef.current) {
-        textareaRef.current.focus();
-        textareaRef.current.setSelectionRange(nextCaret, nextCaret);
+    stepVisualRow(rowSteps);
+  };
+
+  // Tablet & mobile vertical finger-swipe scrolling:
+  // Dragging finger DOWN pulls earlier lines down out of the darkness;
+  // Dragging finger UP pushes lines back up toward the latest line.
+  const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length !== 1) return;
+    touchStartYRef.current = e.touches[0].clientY;
+    touchStartXRef.current = e.touches[0].clientX;
+    touchLastYRef.current = e.touches[0].clientY;
+    touchAccumRef.current = 0;
+    isTouchDraggingRef.current = false;
+  };
+
+  const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length !== 1 || touchLastYRef.current === null) return;
+    const currentY = e.touches[0].clientY;
+    const currentX = e.touches[0].clientX;
+    const totalDy = currentY - (touchStartYRef.current ?? currentY);
+    const totalDx = currentX - (touchStartXRef.current ?? currentX);
+
+    if (!isTouchDraggingRef.current) {
+      if (Math.abs(totalDy) > 8 && Math.abs(totalDy) >= Math.abs(totalDx)) {
+        isTouchDraggingRef.current = true;
+      } else {
+        return;
       }
-      setCaretIndex(nextCaret);
-      setCursorPos(getCursorVisualPosition(fullContent, nextCaret, charsPerLine));
     }
+
+    // Pull finger down (currentY > lastY) => dy < 0 => move to earlier lines above
+    // Push finger up (currentY < lastY) => dy > 0 => move to later lines below
+    const dy = touchLastYRef.current - currentY;
+    touchLastYRef.current = currentY;
+    touchAccumRef.current += dy;
+    lastTouchScrollAtRef.current = Date.now();
+
+    const TOUCH_STEP_PX = 22;
+    if (Math.abs(touchAccumRef.current) < TOUCH_STEP_PX) return;
+
+    const rowSteps =
+      touchAccumRef.current > 0
+        ? Math.floor(touchAccumRef.current / TOUCH_STEP_PX)
+        : Math.ceil(touchAccumRef.current / TOUCH_STEP_PX);
+    touchAccumRef.current -= rowSteps * TOUCH_STEP_PX;
+
+    stepVisualRow(rowSteps);
+  };
+
+  const handleTouchEnd = () => {
+    if (isTouchDraggingRef.current) {
+      lastTouchScrollAtRef.current = Date.now();
+      isTouchDraggingRef.current = false;
+      if (textareaRef.current) {
+        textareaRef.current.setSelectionRange(
+          caretIndexRef.current,
+          caretIndexRef.current
+        );
+      }
+    } else {
+      window.requestAnimationFrame(() => {
+        syncCaretPosition();
+      });
+    }
+    touchStartYRef.current = null;
+    touchStartXRef.current = null;
+    touchLastYRef.current = null;
+    touchAccumRef.current = 0;
   };
 
   // The horizontal rail NEVER moves down. It stays fixed at fixedRailTopPx.
@@ -315,11 +548,17 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
     caretPixel.y + LINE_HEIGHT_PX * 3
   );
 
+  const canGoUpLine = cursorPos.visualRow > 0;
+  const canGoDownLine = cursorPos.visualRow < cursorPos.totalVisualLines - 1;
+
   return (
     <div
       ref={containerRef}
       onScroll={lockZeroScroll}
       onWheel={handleWheel}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
       onClick={(e) => {
         if (e.target !== textareaRef.current) {
           textareaRef.current?.focus();
@@ -333,6 +572,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
         height: '100vh',
         minHeight: `${fixedRailTopPx + 180}px`,
         overflow: 'clip',
+        touchAction: 'pan-x',
       }}
     >
       {/* FIXED HORIZONTAL BRONZE RAIL IN THE CENTER OF THE VIEWPORT */}
@@ -352,6 +592,125 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
           }}
         />
       </div>
+
+      {/* MOVABLE & OPACITY-HIDEABLE TABLET/TOUCH LINE NAVIGATOR (shown when 2+ lines exist) */}
+      {cursorPos.totalVisualLines > 1 && (
+        <div
+          ref={navPillRef}
+          data-testid="movable-line-navigator"
+          onPointerDown={handleNavPointerDown}
+          onPointerMove={handleNavPointerMove}
+          onPointerUp={handleNavPointerUp}
+          onPointerCancel={handleNavPointerUp}
+          onTouchStart={(e) => e.stopPropagation()}
+          onTouchMove={(e) => e.stopPropagation()}
+          onTouchEnd={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          className="absolute left-1/2 z-30 flex items-center gap-1 px-2 py-1 rounded-full select-none transition-opacity duration-200 cursor-grab active:cursor-grabbing"
+          style={{
+            top: `${fixedRailTopPx + 28}px`,
+            transform: `translate3d(calc(-50% + ${navOffset.x}px), ${navOffset.y}px, 0)`,
+            opacity: isNavDimmed ? 0.16 : 0.94,
+            background: 'rgba(34, 28, 22, 0.78)',
+            border: '1px solid rgba(133, 106, 78, 0.3)',
+            boxShadow: isNavDimmed
+              ? 'none'
+              : '0 4px 14px rgba(0, 0, 0, 0.48)',
+            touchAction: 'none',
+          }}
+        >
+          {/* Drag grip handle indicator */}
+          <span
+            aria-hidden="true"
+            className="flex items-center justify-center text-[#8C7A64] pl-0.5 pr-0.5 pointer-events-none"
+            title="Arrastrar para mover por la pantalla"
+          >
+            <GripVertical className="w-3.5 h-3.5" />
+          </span>
+
+          <button
+            type="button"
+            aria-label="Subir a la línea anterior"
+            disabled={!canGoUpLine}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              if (wasNavDraggedRef.current) return;
+              stepVisualRow(-1);
+            }}
+            className={`w-6 h-6 rounded-full flex items-center justify-center text-xs transition-colors ${
+              canGoUpLine
+                ? 'text-[#E3D3BA] hover:bg-[#3A2F24] active:bg-[#4B3D2F] cursor-pointer'
+                : 'text-[#5A4E40] cursor-not-allowed'
+            }`}
+            title="Ver línea anterior (↑)"
+          >
+            ↑
+          </button>
+
+          <span className="text-[11px] font-sans tracking-wide text-[#9E8C75] px-1 tabular-nums">
+            Línea {cursorPos.visualRow + 1} / {cursorPos.totalVisualLines}
+          </span>
+
+          <button
+            type="button"
+            aria-label="Bajar a la línea siguiente"
+            disabled={!canGoDownLine}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              if (wasNavDraggedRef.current) return;
+              stepVisualRow(1);
+            }}
+            className={`w-6 h-6 rounded-full flex items-center justify-center text-xs transition-colors ${
+              canGoDownLine
+                ? 'text-[#E3D3BA] hover:bg-[#3A2F24] active:bg-[#4B3D2F] cursor-pointer'
+                : 'text-[#5A4E40] cursor-not-allowed'
+            }`}
+            title="Ver línea siguiente (↓)"
+          >
+            ↓
+          </button>
+
+          {canGoDownLine && (
+            <button
+              type="button"
+              aria-label="Volver a la última línea escrita"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                if (wasNavDraggedRef.current) return;
+                jumpToLatestLine();
+              }}
+              className="ml-0.5 px-2 py-0.5 rounded-full text-[11px] font-sans text-[#EAD9BF] bg-[#3B2F23] hover:bg-[#4D3E2E] active:bg-[#5B4937] transition-colors cursor-pointer"
+              title="Volver al final del texto"
+            >
+              Final ↓
+            </button>
+          )}
+
+          {/* Eye button to hide/show the pill by lowering its opacity */}
+          <button
+            type="button"
+            aria-label={
+              isNavDimmed
+                ? 'Mostrar controles de línea'
+                : 'Ocultar controles bajando su opacidad'
+            }
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={toggleNavDimmed}
+            className="w-6 h-6 rounded-full flex items-center justify-center text-[#C4B197] hover:text-[#F2E3CC] hover:bg-[#3A2F24] active:bg-[#4B3D2F] transition-colors cursor-pointer ml-0.5"
+            title={
+              isNavDimmed
+                ? 'Restaurar opacidad'
+                : 'Ocultar bajando la opacidad'
+            }
+          >
+            {isNavDimmed ? (
+              <EyeOff className="w-3.5 h-3.5" />
+            ) : (
+              <Eye className="w-3.5 h-3.5" />
+            )}
+          </button>
+        </div>
+      )}
 
       {/* CENTERED TYPEWRITER COLUMN */}
       <div
@@ -598,7 +957,6 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
               onKeyDown={handleKeyDown}
               onClick={syncCaretPosition}
               onMouseUp={syncCaretPosition}
-              onTouchEnd={syncCaretPosition}
               onKeyUp={syncCaretPosition}
               onSelect={syncCaretPosition}
               onScroll={lockZeroScroll}
@@ -615,6 +973,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
                 color: 'transparent',
                 caretColor: '#F3D08E',
                 overflow: 'clip',
+                touchAction: 'pan-x',
               }}
               className="relative z-20 w-full bg-transparent resize-none border-0 focus:outline-none whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em] selection:bg-[#D99B4E]/35 selection:text-transparent"
             />
