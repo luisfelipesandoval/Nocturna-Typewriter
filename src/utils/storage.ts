@@ -107,8 +107,8 @@ export function loadPreferences(defaultNotebookId: string): UserPreferences {
   const fallback: UserPreferences = {
     activeNotebookId: defaultNotebookId,
     activePageIndex: 0,
-    maxLinesPerPage: 16,
-    autoTurnPages: true,
+    maxLinesPerPage: 20,
+    autoTurnPages: false,
     showRuledLines: false,
     lampIntensity: 'calida',
     masterKeyVolume: 0.65,

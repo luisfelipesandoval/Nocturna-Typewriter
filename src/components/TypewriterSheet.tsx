@@ -25,7 +25,6 @@ interface TypewriterSheetProps {
 }
 
 const LINE_HEIGHT_PX = 34;
-const WRITING_OFFSET_TOP_PX = 290;
 
 export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
   notebook,
@@ -50,10 +49,16 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
     getCursorVisualPosition(fullContent, fullContent.length, charsPerLine)
   );
 
-  // Exact pixel coordinates of the caret relative to the centered writing column
+  // Fixed vertical rail position in the center of the viewport (never moves down when typing)
+  const [fixedRailTopPx, setFixedRailTopPx] = useState<number>(() => {
+    if (typeof window === 'undefined') return 420;
+    return Math.max(320, Math.min(540, Math.round(window.innerHeight * 0.62)));
+  });
+
+  // Exact pixel coordinates of the caret inside the paper block
   const [caretPixel, setCaretPixel] = useState<{ x: number; y: number }>({
-    x: 0,
-    y: WRITING_OFFSET_TOP_PX,
+    x: 24,
+    y: 0,
   });
 
   const [isActivelyTyping, setIsActivelyTyping] = useState(false);
@@ -75,6 +80,9 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
         y: marker.offsetTop,
       });
     }
+    if (textareaRef.current) {
+      textareaRef.current.scrollTop = 0;
+    }
   }, []);
 
   useLayoutEffect(() => {
@@ -82,8 +90,14 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
   }, [fullContent, caretIndex, measureCaretPixels, showRuledLines]);
 
   useEffect(() => {
-    window.addEventListener('resize', measureCaretPixels);
-    return () => window.removeEventListener('resize', measureCaretPixels);
+    const handleResize = () => {
+      setFixedRailTopPx(
+        Math.max(320, Math.min(540, Math.round(window.innerHeight * 0.62)))
+      );
+      measureCaretPixels();
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
   }, [measureCaretPixels]);
 
   // Detect page changes for smooth visual transition
@@ -101,6 +115,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
       if (textareaRef.current) {
         textareaRef.current.focus();
         textareaRef.current.setSelectionRange(len, len);
+        textareaRef.current.scrollTop = 0;
       }
       setCursorPos(getCursorVisualPosition(pageText, len, charsPerLine));
       return () => window.clearTimeout(timer);
@@ -161,6 +176,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
   const syncCaretPosition = () => {
     const el = textareaRef.current;
     if (!el) return;
+    el.scrollTop = 0;
     hasExplicitCaretRef.current = true;
     const sel = el.selectionStart ?? el.value.length;
     setCaretIndex(sel);
@@ -169,6 +185,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     hasExplicitCaretRef.current = true;
+    e.target.scrollTop = 0;
     const nextValue = e.target.value;
     const caret = e.target.selectionStart ?? nextValue.length;
     setCaretIndex(caret);
@@ -176,50 +193,71 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
     onUpdatePageContent(nextValue, caret);
   };
 
-  const clampedRow = Math.min(
-    maxLinesPerPage - 1,
-    Math.max(0, cursorPos.visualRow)
-  );
+  // The horizontal rail NEVER moves down. It stays fixed at fixedRailTopPx.
+  // The active line (caretPixel.y) is always pinned right above the "T" hammer on the rail,
+  // and as more lines are written, the text translates UPWARD into the darkness.
+  const stageHeightPx = fixedRailTopPx - 10;
+  const activeLineTargetY = stageHeightPx - LINE_HEIGHT_PX - 4;
+  const textTranslateY = activeLineTargetY - caretPixel.y;
 
-  // Full-width horizontal rail sits directly underneath the active character line
-  const railTopPx = caretPixel.y + LINE_HEIGHT_PX + 10;
   const spotlightCenterX = caretPixel.x;
-  const spotlightCenterY = caretPixel.y + LINE_HEIGHT_PX * 0.52;
 
   const intensityMultiplier =
-    lampIntensity === 'suave' ? 0.65 : lampIntensity === 'intensa' ? 1.35 : 1.0;
-
-  const surfaceMinHeightPx =
-    WRITING_OFFSET_TOP_PX + maxLinesPerPage * LINE_HEIGHT_PX + 140;
+    lampIntensity === 'suave' ? 0.7 : lampIntensity === 'intensa' ? 1.3 : 1.0;
 
   const textBeforeCaret = fullContent.slice(0, caretIndex);
   const textAfterCaret = fullContent.slice(caretIndex);
 
-  // Spotlight mask so characters inside the upward beam glow bright bone-white
-  // while characters further outside the cone rest in soft shadow
-  const spotlightRadiusPx =
-    lampIntensity === 'suave' ? 140 : lampIntensity === 'intensa' ? 225 : 175;
-  const spotlightMaskGradient = `radial-gradient(ellipse ${spotlightRadiusPx}px ${
-    spotlightRadiusPx * 1.5
-  }px at ${spotlightCenterX}px ${
-    spotlightCenterY - 24
-  }px, rgba(0,0,0,1) 0%, rgba(0,0,0,0.92) 40%, rgba(0,0,0,0.32) 72%, rgba(0,0,0,0) 100%)`;
+  // Single non-nested vertical fade mask on Text Layer A (in paper coordinates)
+  // so older lines fade progressively into the dark background as they rise above the rail:
+  const activeTop = caretPixel.y;
+  const activeBot = caretPixel.y + LINE_HEIGHT_PX + 4;
+  const row1Up = Math.max(0, activeTop - LINE_HEIGHT_PX * 1);
+  const row2Up = Math.max(0, activeTop - LINE_HEIGHT_PX * 2);
+  const row3Up = Math.max(0, activeTop - LINE_HEIGHT_PX * 3);
+  const row4Up = Math.max(0, activeTop - LINE_HEIGHT_PX * 4);
+  const row5Up = Math.max(0, activeTop - LINE_HEIGHT_PX * 5.2);
+
+  const baseTextVerticalFadeMask =
+    activeTop <= 4
+      ? `linear-gradient(180deg, rgba(0,0,0,1) 0px, rgba(0,0,0,1) ${activeBot}px, rgba(0,0,0,0) ${
+          activeBot + 4
+        }px)`
+      : `linear-gradient(180deg, rgba(0,0,0,0) 0px, rgba(0,0,0,0) ${row5Up}px, rgba(0,0,0,0.12) ${row4Up}px, rgba(0,0,0,0.26) ${row3Up}px, rgba(0,0,0,0.44) ${row2Up}px, rgba(0,0,0,0.68) ${row1Up}px, rgba(0,0,0,0.92) ${activeTop}px, rgba(0,0,0,0.92) ${activeBot}px, rgba(0,0,0,0) ${
+          activeBot + 4
+        }px)`;
+
+  // Single non-nested radial spotlight mask on Text Layer B (in paper coordinates)
+  // centered at the caret so characters touched by the light beam shine in crisp cream (#FFF6E6)
+  // on the active line and fade naturally upward along the beam cone without washing out:
+  const spotlightRadiusX =
+    lampIntensity === 'suave' ? 115 : lampIntensity === 'intensa' ? 185 : 145;
+  const spotlightRadiusY =
+    lampIntensity === 'suave' ? 135 : lampIntensity === 'intensa' ? 205 : 170;
+  const spotlightMaskGradient = `radial-gradient(ellipse ${spotlightRadiusX}px ${spotlightRadiusY}px at ${spotlightCenterX}px ${
+    caretPixel.y + LINE_HEIGHT_PX * 0.55
+  }px, rgba(0,0,0,1) 0%, rgba(0,0,0,0.92) 28%, rgba(0,0,0,0.52) 56%, rgba(0,0,0,0.18) 80%, rgba(0,0,0,0) 100%)`;
+
+  const dynamicPaperHeightPx = Math.max(
+    800,
+    caretPixel.y + LINE_HEIGHT_PX * 10 + 400
+  );
 
   return (
     <div
       ref={containerRef}
       onClick={() => textareaRef.current?.focus()}
-      className={`relative w-full flex-1 flex flex-col items-center justify-start transition-opacity duration-200 cursor-text ${
+      className={`relative w-full flex-1 overflow-hidden flex flex-col items-center justify-start transition-opacity duration-200 cursor-text ${
         pageTurnDirection ? 'opacity-85' : 'opacity-100'
       }`}
-      style={{ minHeight: `${surfaceMinHeightPx}px` }}
+      style={{ height: '100vh', minHeight: `${fixedRailTopPx + 180}px` }}
     >
-      {/* Full-viewport horizontal bronze/brown carriage track rail stretching edge-to-edge */}
+      {/* FIXED HORIZONTAL BRONZE RAIL IN THE CENTER OF THE VIEWPORT */}
       <div
         aria-hidden="true"
         className="absolute left-0 right-0 pointer-events-none select-none z-10"
         style={{
-          top: `${railTopPx}px`,
+          top: `${fixedRailTopPx}px`,
         }}
       >
         <div
@@ -232,44 +270,18 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
         />
       </div>
 
-      {/* Centered Typewriter Writing Column */}
+      {/* CENTERED TYPEWRITER COLUMN */}
       <div
         className="relative w-full max-w-[680px] mx-auto"
-        style={{ minHeight: `${surfaceMinHeightPx}px` }}
+        style={{ height: `${fixedRailTopPx + 180}px` }}
       >
-        {/* Optional Subtle Ruled Lines (only if user enables them) */}
-        {showRuledLines && (
-          <div
-            aria-hidden="true"
-            className="absolute inset-x-0 pointer-events-none select-none z-0"
-            style={{
-              top: `${WRITING_OFFSET_TOP_PX}px`,
-            }}
-          >
-            {Array.from({ length: maxLinesPerPage }).map((_, idx) => {
-              const isActiveRow = idx === clampedRow;
-              return (
-                <div
-                  key={idx}
-                  style={{ height: `${LINE_HEIGHT_PX}px` }}
-                  className={`w-full border-b transition-colors duration-200 ${
-                    isActiveRow
-                      ? 'border-[#544436]/35'
-                      : 'border-[#2D241C]/40'
-                  }`}
-                />
-              );
-            })}
-          </div>
-        )}
-
-        {/* 1. VOLUMETRIC UPWARD LIGHT CONE + CAPSULE CARRIAGE WITH "T" HAMMER */}
+        {/* 1. VOLUMETRIC UPWARD LIGHT CONE + CAPSULE CARRIAGE WITH "T" HAMMER (Pinned to fixed center rail) */}
         <div
           aria-hidden="true"
           data-testid="typewriter-carriage-lamp"
           className="absolute left-0 right-0 pointer-events-none select-none z-10"
           style={{
-            top: `${railTopPx}px`,
+            top: `${fixedRailTopPx}px`,
           }}
         >
           <div
@@ -280,7 +292,7 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
               left: `${spotlightCenterX}px`,
             }}
           >
-            {/* Large Soft Ambient Halo behind the cone (like reference image) */}
+            {/* Large Soft Warm Ambient Halo behind the cone (translucent so letters never wash out) */}
             <div
               className="pointer-events-none -translate-x-1/2"
               style={{
@@ -289,82 +301,82 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
                 left: '50%',
                 width: '720px',
                 height: '440px',
-                background: `radial-gradient(ellipse 55% 65% at 50% 72%, rgba(215, 178, 126, ${
-                  0.18 * intensityMultiplier
-                }) 0%, rgba(168, 134, 88, ${
-                  0.07 * intensityMultiplier
+                background: `radial-gradient(ellipse 55% 65% at 50% 72%, rgba(206, 165, 110, ${
+                  0.13 * intensityMultiplier
+                }) 0%, rgba(158, 122, 76, ${
+                  0.05 * intensityMultiplier
                 }) 52%, transparent 88%)`,
-                filter: 'blur(20px)',
+                filter: 'blur(22px)',
               }}
             />
 
-            {/* Wide Tall Volumetric Spotlight Cone fanning upward from the "T" tip */}
+            {/* Wide Volumetric Spotlight Cone fanning upward from the "T" tip (dark-amber translucent glow) */}
             <div
               className="pointer-events-none -translate-x-1/2"
               style={{
                 position: 'absolute',
-                bottom: '13px',
+                bottom: '14px',
                 left: '50%',
-                width: '560px',
-                height: '340px',
-                background: `conic-gradient(from -36deg at 50% 100%, transparent 0deg, rgba(224, 188, 138, ${
-                  0.04 * intensityMultiplier
-                }) 9deg, rgba(235, 199, 148, ${
-                  0.26 * intensityMultiplier
-                }) 24deg, rgba(250, 222, 178, ${
-                  0.42 * intensityMultiplier
-                }) 36deg, rgba(235, 199, 148, ${
-                  0.26 * intensityMultiplier
-                }) 48deg, rgba(224, 188, 138, ${
-                  0.04 * intensityMultiplier
+                width: '540px',
+                height: '330px',
+                background: `conic-gradient(from -36deg at 50% 100%, transparent 0deg, rgba(212, 174, 122, ${
+                  0.03 * intensityMultiplier
+                }) 9deg, rgba(222, 182, 128, ${
+                  0.15 * intensityMultiplier
+                }) 24deg, rgba(238, 198, 142, ${
+                  0.24 * intensityMultiplier
+                }) 36deg, rgba(222, 182, 128, ${
+                  0.15 * intensityMultiplier
+                }) 48deg, rgba(212, 174, 122, ${
+                  0.03 * intensityMultiplier
                 }) 63deg, transparent 72deg)`,
                 maskImage:
-                  'radial-gradient(ellipse 68% 96% at 50% 100%, black 0%, rgba(0,0,0,0.82) 54%, transparent 96%)',
+                  'radial-gradient(ellipse 68% 96% at 50% 100%, black 0%, rgba(0,0,0,0.78) 54%, transparent 96%)',
                 WebkitMaskImage:
-                  'radial-gradient(ellipse 68% 96% at 50% 100%, black 0%, rgba(0,0,0,0.82) 54%, transparent 96%)',
-                filter: 'blur(9px)',
+                  'radial-gradient(ellipse 68% 96% at 50% 100%, black 0%, rgba(0,0,0,0.78) 54%, transparent 96%)',
+                filter: 'blur(10px)',
               }}
             />
 
-            {/* Core intense warm hotspot directly illuminating the active character & caret */}
+            {/* Focused warm beam origin just above the "T" crossbar (kept subtle so cream letters stay razor-sharp) */}
             <div
               className="pointer-events-none -translate-x-1/2"
               style={{
                 position: 'absolute',
-                bottom: '11px',
+                bottom: '12px',
                 left: '50%',
-                width: '180px',
-                height: '130px',
-                background: `radial-gradient(ellipse 52% 85% at 50% 100%, rgba(255, 232, 192, ${
-                  0.48 * intensityMultiplier
-                }) 0%, rgba(228, 186, 128, ${
+                width: '160px',
+                height: '115px',
+                background: `radial-gradient(ellipse 50% 82% at 50% 100%, rgba(235, 195, 138, ${
                   0.22 * intensityMultiplier
+                }) 0%, rgba(208, 166, 110, ${
+                  0.11 * intensityMultiplier
                 }) 48%, transparent 92%)`,
-                clipPath: 'polygon(43% 100%, 57% 100%, 100% 0%, 0% 0%)',
-                filter: 'blur(4px)',
+                clipPath: 'polygon(42% 100%, 58% 100%, 100% 0%, 0% 0%)',
+                filter: 'blur(5px)',
               }}
             />
 
             {/* The "T" Typebar Hammer Post rising above the capsule toward the active character */}
             <div
-              className={`relative flex flex-col items-center -mt-[14px] transition-transform duration-75 ${
+              className={`relative flex flex-col items-center -mt-[15px] transition-transform duration-75 ${
                 hammerStrike ? '-translate-y-1' : 'translate-y-0'
               }`}
             >
               {/* Horizontal crossbar of the "T" */}
               <div
-                className="w-[11px] h-[2.5px] rounded-[1px]"
+                className="w-[12px] h-[2.5px] rounded-[1px]"
                 style={{
-                  background: '#F4E5CE',
-                  boxShadow: '0 0 8px rgba(248, 212, 156, 0.75)',
+                  background: '#F0DFC5',
+                  boxShadow: '0 0 6px rgba(240, 204, 148, 0.55)',
                 }}
               />
               {/* Vertical stem of the "T" */}
               <div
-                className="w-[2.5px] h-[10px]"
+                className="w-[2.5px] h-[11px]"
                 style={{
                   background:
-                    'linear-gradient(180deg, #F4E5CE 0%, #CBB79A 100%)',
+                    'linear-gradient(180deg, #F0DFC5 0%, #C8B396 100%)',
                 }}
               />
             </div>
@@ -396,85 +408,128 @@ export const TypewriterSheet: React.FC<TypewriterSheetProps> = ({
           </div>
         </div>
 
-        {/* 2. HIDDEN MIRROR LAYER: Measures exact pixel (x, y) of the active caret */}
+        {/* 2. PAPER STAGE ABOVE THE FIXED CENTER RAIL — Clips anything below the horizontal rail */}
         <div
-          aria-hidden="true"
+          className="absolute top-0 left-0 right-0 overflow-hidden z-20"
           style={{
-            paddingTop: `${WRITING_OFFSET_TOP_PX}px`,
-            paddingBottom: '80px',
-            paddingLeft: '24px',
-            paddingRight: '24px',
-            lineHeight: `${LINE_HEIGHT_PX}px`,
+            height: `${stageHeightPx}px`,
           }}
-          className="absolute inset-0 pointer-events-none invisible whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em]"
         >
-          <span>{textBeforeCaret}</span>
-          <span
-            ref={mirrorCaretRef}
-            data-testid="caret-pixel-anchor"
-            className="inline-block w-0 h-[18px] align-baseline"
-          />
-          <span>{textAfterCaret || ' '}</span>
-        </div>
+          {/* UPWARD-SHIFTING PAPER LAYER: Moves up as new lines are typed so active line stays at the fixed rail */}
+          <div
+            className="relative w-full transition-transform duration-150 ease-out"
+            style={{
+              height: `${dynamicPaperHeightPx}px`,
+              transform: `translate3d(0, ${textTranslateY}px, 0)`,
+            }}
+          >
+            {/* Optional Subtle Ruled Lines (moves up with paper if enabled) */}
+            {showRuledLines && (
+              <div
+                aria-hidden="true"
+                className="absolute inset-x-0 top-0 pointer-events-none select-none z-0"
+              >
+                {Array.from({
+                  length: Math.max(maxLinesPerPage, cursorPos.visualRow + 6),
+                }).map((_, idx) => {
+                  const isActiveRow = idx === cursorPos.visualRow;
+                  return (
+                    <div
+                      key={idx}
+                      style={{ height: `${LINE_HEIGHT_PX}px` }}
+                      className={`w-full border-b transition-colors duration-200 ${
+                        isActiveRow
+                          ? 'border-[#544436]/35'
+                          : 'border-[#2D241C]/40'
+                      }`}
+                    />
+                  );
+                })}
+              </div>
+            )}
 
-        {/* 3. VISUAL TEXT LAYER A — Dimmed Nocturnal Ink outside the spotlight beam */}
-        <div
-          aria-hidden="true"
-          style={{
-            paddingTop: `${WRITING_OFFSET_TOP_PX}px`,
-            paddingBottom: '80px',
-            paddingLeft: '24px',
-            paddingRight: '24px',
-            lineHeight: `${LINE_HEIGHT_PX}px`,
-          }}
-          className="absolute inset-0 pointer-events-none select-none whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em] text-[#7D7163] z-15"
-        >
-          {fullContent}
-        </div>
+            {/* HIDDEN MIRROR LAYER: Measures exact pixel (x, y) of the active caret inside the paper */}
+            <div
+              aria-hidden="true"
+              style={{
+                paddingTop: '0px',
+                paddingBottom: '80px',
+                paddingLeft: '24px',
+                paddingRight: '24px',
+                lineHeight: `${LINE_HEIGHT_PX}px`,
+              }}
+              className="absolute inset-0 pointer-events-none invisible whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em]"
+            >
+              <span>{textBeforeCaret}</span>
+              <span
+                ref={mirrorCaretRef}
+                data-testid="caret-pixel-anchor"
+                className="inline-block w-0 h-[18px] align-baseline"
+              />
+              <span>{textAfterCaret || ' '}</span>
+            </div>
 
-        {/* 4. VISUAL TEXT LAYER B — Bright Illuminated Cream Ink inside the spotlight cone */}
-        <div
-          aria-hidden="true"
-          data-testid="spotlight-illuminated-text"
-          style={{
-            paddingTop: `${WRITING_OFFSET_TOP_PX}px`,
-            paddingBottom: '80px',
-            paddingLeft: '24px',
-            paddingRight: '24px',
-            lineHeight: `${LINE_HEIGHT_PX}px`,
-            maskImage: spotlightMaskGradient,
-            WebkitMaskImage: spotlightMaskGradient,
-            textShadow: '0 0 12px rgba(252, 215, 151, 0.35)',
-          }}
-          className="absolute inset-0 pointer-events-none select-none whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em] text-[#FAF0DF] z-15"
-        >
-          {fullContent}
-        </div>
+            {/* VISUAL TEXT LAYER A — Muted Nocturnal Ink outside the spotlight cone, fading into darkness as lines rise */}
+            <div
+              aria-hidden="true"
+              style={{
+                paddingTop: '0px',
+                paddingBottom: '80px',
+                paddingLeft: '24px',
+                paddingRight: '24px',
+                lineHeight: `${LINE_HEIGHT_PX}px`,
+                maskImage: baseTextVerticalFadeMask,
+                WebkitMaskImage: baseTextVerticalFadeMask,
+              }}
+              className="absolute inset-0 pointer-events-none select-none whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em] text-[#7D6F5D] z-15"
+            >
+              {fullContent}
+            </div>
 
-        {/* 5. INTERACTIVE TEXTAREA — Transparent ink with warm golden caret aligned to the "T" spotlight */}
-        <textarea
-          ref={textareaRef}
-          value={fullContent}
-          onChange={handleChange}
-          onKeyDown={handleKeyDown}
-          onClick={syncCaretPosition}
-          onKeyUp={syncCaretPosition}
-          onSelect={syncCaretPosition}
-          aria-label={`Contenido de la hoja ${activePageIndex + 1}`}
-          spellCheck={false}
-          autoFocus
-          style={{
-            paddingTop: `${WRITING_OFFSET_TOP_PX}px`,
-            paddingBottom: '80px',
-            paddingLeft: '24px',
-            paddingRight: '24px',
-            lineHeight: `${LINE_HEIGHT_PX}px`,
-            minHeight: `${surfaceMinHeightPx}px`,
-            color: 'transparent',
-            caretColor: '#E8C382',
-          }}
-          className="relative z-20 w-full bg-transparent resize-none border-0 focus:outline-none whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em] selection:bg-[#D99B4E]/35 selection:text-transparent"
-        />
+            {/* VISUAL TEXT LAYER B — Crisp High-Contrast Warm Cream Ink inside the spotlight cone */}
+            <div
+              aria-hidden="true"
+              data-testid="spotlight-illuminated-text"
+              style={{
+                paddingTop: '0px',
+                paddingBottom: '80px',
+                paddingLeft: '24px',
+                paddingRight: '24px',
+                lineHeight: `${LINE_HEIGHT_PX}px`,
+                maskImage: spotlightMaskGradient,
+                WebkitMaskImage: spotlightMaskGradient,
+              }}
+              className="absolute inset-0 pointer-events-none select-none whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em] text-[#F7EBD9] z-16"
+            >
+              {fullContent}
+            </div>
+
+            {/* INTERACTIVE TEXTAREA — Transparent ink with warm golden caret aligned to the "T" spotlight */}
+            <textarea
+              ref={textareaRef}
+              value={fullContent}
+              onChange={handleChange}
+              onKeyDown={handleKeyDown}
+              onClick={syncCaretPosition}
+              onKeyUp={syncCaretPosition}
+              onSelect={syncCaretPosition}
+              aria-label={`Contenido de la hoja ${activePageIndex + 1}`}
+              spellCheck={false}
+              autoFocus
+              style={{
+                paddingTop: '0px',
+                paddingBottom: '80px',
+                paddingLeft: '24px',
+                paddingRight: '24px',
+                lineHeight: `${LINE_HEIGHT_PX}px`,
+                height: `${dynamicPaperHeightPx}px`,
+                color: 'transparent',
+                caretColor: '#F3D08E',
+              }}
+              className="relative z-20 w-full overflow-hidden bg-transparent resize-none border-0 focus:outline-none whitespace-pre-wrap break-words font-typewriter text-[18px] tracking-[0.02em] selection:bg-[#D99B4E]/35 selection:text-transparent"
+            />
+          </div>
+        </div>
       </div>
     </div>
   );
